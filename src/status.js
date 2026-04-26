@@ -36,7 +36,7 @@ export function summarizeAppServerSession(thread) {
   };
 }
 
-export function summarizeAppServerStatus(threads, error = null) {
+export function summarizeAppServerStatus(threads, botStatus = null, error = null) {
   const items = Array.isArray(threads) ? threads : [];
   const projects = new Set(items.map((thread) => normalizeThreadCwd(thread?.cwd)).filter(Boolean));
   const latestUpdatedAt = items.reduce((latest, thread) => {
@@ -49,7 +49,10 @@ export function summarizeAppServerStatus(threads, error = null) {
     threadCount: items.length,
     projectCount: projects.size,
     latestUpdatedAt: latestUpdatedAt || null,
-    error: error ? String(error.message || error) : null
+    error: error ? String(error.message || error) : null,
+    botConfigured: botStatus?.configured ?? false,
+    botRunning: botStatus?.running ?? false,
+    botDetail: botStatus?.detail || ""
   };
 }
 

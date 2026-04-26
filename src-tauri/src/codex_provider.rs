@@ -1,22 +1,8 @@
+use crate::config::{read_config_at, write_config_at, CodexProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodexProvider {
-    pub id: String,
-    pub name: String,
-    pub base_url: String,
-    pub model: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub config_text: Option<String>,
-    #[serde(default)]
-    pub active: bool,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +28,7 @@ pub struct ProviderStore {
 }
 
 impl ProviderStore {
+    #[allow(dead_code)]
     fn empty() -> Self {
         Self {
             active_id: None,
@@ -125,9 +112,7 @@ pub fn read_live_config(codex_dir: &Path) -> Result<String, String> {
 }
 
 pub fn default_store_path() -> Result<PathBuf, String> {
-    project_root()
-        .map(|root| root.join("data").join("codex-providers.json"))
-        .ok_or_else(|| "无法定位项目目录".to_string())
+    crate::config::default_config_path()
 }
 
 pub fn default_codex_dir() -> Result<PathBuf, String> {
@@ -176,21 +161,18 @@ pub fn mask_secret(value: &str) -> String {
 }
 
 fn read_store(path: &Path) -> Result<ProviderStore, String> {
-    if !path.exists() {
-        return Ok(ProviderStore::empty());
-    }
-    let text =
-        fs::read_to_string(path).map_err(|err| format!("读取 Codex 供应商配置失败：{err}"))?;
-    serde_json::from_str(&text).map_err(|err| format!("解析 Codex 供应商配置失败：{err}"))
+    let config = read_config_at(path)?;
+    Ok(ProviderStore {
+        active_id: config.active_provider_id,
+        providers: config.providers,
+    })
 }
 
 fn write_store(path: &Path, store: &ProviderStore) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("创建配置目录失败：{err}"))?;
-    }
-    let text = serde_json::to_string_pretty(store)
-        .map_err(|err| format!("编码 Codex 供应商配置失败：{err}"))?;
-    atomic_write(path, text.as_bytes())
+    let mut config = read_config_at(path)?;
+    config.active_provider_id = store.active_id.clone();
+    config.providers = store.providers.clone();
+    write_config_at(path, &config)
 }
 
 fn write_codex_live_config(codex_dir: &Path, provider: &CodexProvider) -> Result<(), String> {
@@ -287,11 +269,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|err| format!("写入临时文件失败：{err}"))?;
     fs::rename(&tmp, path).map_err(|err| format!("替换文件失败：{err}"))
-}
-
-fn project_root() -> Option<PathBuf> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().map(Path::to_path_buf)
 }
 
 #[cfg(test)]

@@ -564,17 +564,39 @@ async fn read_persistent_turn_output_or_interrupt(
     }
 }
 
+fn spawn_codex_command(codex_path: &str, process_cwd: &Path) -> Result<Child, String> {
+    let mut cmd = Command::new(codex_path);
+    cmd.arg("app-server")
+        .current_dir(process_cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    if let Ok(current_path) = std::env::var("PATH") {
+        let mut extra = vec!["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()];
+        if let Some(home) = dirs::home_dir() {
+            extra.push(home.join(".local/bin").to_string_lossy().to_string());
+        }
+        let new_path = format!("{}:{}", extra.join(":"), current_path);
+        cmd.env("PATH", new_path);
+    }
+
+    cmd.spawn().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "未找到 codex 命令（{}）。请在「设置」中配置 Codex 路径，或确保 codex 已安装且可被访问。",
+                codex_path
+            )
+        } else {
+            format!("启动 codex app-server 失败：{err}")
+        }
+    })
+}
+
 impl PersistentAppServerClient {
     pub async fn start(codex_path: &str, cwd: Option<&str>) -> Result<Self, String> {
         let process_cwd = process_cwd(cwd)?;
-        let mut child = Command::new(codex_path)
-            .arg("app-server")
-            .current_dir(&process_cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| format!("启动 codex app-server 失败：{err}"))?;
+        let mut child = spawn_codex_command(codex_path, &process_cwd)?;
 
         let stdin = child
             .stdin
@@ -757,14 +779,7 @@ struct AppServerConnection {
 
 impl AppServerConnection {
     async fn start(codex_path: &str, process_cwd: &Path) -> Result<Self, String> {
-        let mut child = Command::new(codex_path)
-            .arg("app-server")
-            .current_dir(process_cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| format!("启动 codex app-server 失败：{err}"))?;
+        let mut child = spawn_codex_command(codex_path, process_cwd)?;
 
         let stdin = child
             .stdin

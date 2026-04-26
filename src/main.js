@@ -169,7 +169,17 @@ function renderStatusPage() {
         <div><span>项目</span><strong>${status.projectCount}</strong><small>个</small></div>
         <div><span>最近更新</span><strong>${formatShortTime(status.latestUpdatedAt)}</strong><small>${formatShortDate(status.latestUpdatedAt)}</small></div>
       </div>
-      <div class="lower-grid">
+      <article class="status-card" style="margin-top:10px">
+        <div class="pulse-icon">◎</div>
+        <div class="status-main">
+          <div>
+            <span>Telegram Bot</span>
+            <strong>${status.botRunning ? "运行中" : status.botConfigured ? "已停止" : "未配置"}</strong>
+          </div>
+          <p>${escapeHtml(status.botDetail)}</p>
+        </div>
+      </article>
+      <div class="lower-grid" style="margin-top:10px">
         <article class="panel-card">
           <header><strong>最近活动</strong></header>
           <ul class="activity-list">
@@ -183,6 +193,7 @@ function renderStatusPage() {
           <div class="health-list">
             <p><span>● Admin 连接</span><b>${status.connected ? "正常" : "异常"}</b></p>
             <p><span>● App-server</span><b>${status.connected ? "在线" : "离线"}</b></p>
+            <p><span>● Telegram Bot</span><b>${status.botRunning ? "正常" : status.botConfigured ? "已停止" : "未配置"}</b></p>
             <p><span>● 配置读取</span><b>成功</b></p>
           </div>
         </article>
@@ -421,11 +432,14 @@ function openProviderEditor(id) {
 async function refreshStatus() {
   state.loading = true;
   try {
-    const threads = await fetchAppServerThreads(100);
-    state.status = summarizeAppServerStatus(threads);
+    const [threads, botStatus] = await Promise.all([
+      fetchAppServerThreads(100),
+      fetchTelegramBotStatus()
+    ]);
+    state.status = summarizeAppServerStatus(threads, botStatus);
     clearMessage();
   } catch (error) {
-    state.status = summarizeAppServerStatus([], error);
+    state.status = summarizeAppServerStatus([], null, error);
     setError(error);
   } finally {
     state.loading = false;

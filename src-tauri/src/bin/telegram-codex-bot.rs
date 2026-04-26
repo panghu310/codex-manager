@@ -318,12 +318,7 @@ impl Bot {
         }
         self.current_thread_id = Some(tracked.thread_id.clone());
         self.current_project_dir = tracked.project_dir.clone();
-        self.rollback_recent(
-            message.chat.id,
-            1,
-            Some((message.message_id, prompt.to_string())),
-        )
-        .await
+        self.ask(message.chat.id, message.message_id, prompt).await
     }
 
     async fn handle_callback(&mut self, callback: CallbackQuery) -> Result<(), String> {
@@ -348,8 +343,6 @@ impl Bot {
             "status" => self.edit_status(message.chat.id, message.message_id).await,
             "menu" => self.edit_menu(message.chat.id, message.message_id).await,
             "stop" => self.stop_active_turn(message.chat.id).await,
-            "rollback:1" => self.rollback_recent(message.chat.id, 1, None).await,
-            "rollback:2" => self.rollback_recent(message.chat.id, 2, None).await,
             value if value.starts_with("history:") => {
                 let token = value.trim_start_matches("history:");
                 if let Some(target) = self.thread_tokens.get(token).cloned() {
@@ -423,6 +416,10 @@ impl Bot {
 
     async fn ask(&mut self, chat_id: i64, message_id: i64, prompt: &str) -> Result<(), String> {
         self.clear_finished_task();
+        let is_new_thread = self.current_thread_id.is_none() && self.active_turn.is_none();
+        if is_new_thread {
+            self.send_text(chat_id, "当前未绑定对话，已为你开启新独立对话。").await?;
+        }
         if let Some(active) = self.active_turn.clone() {
             self.app_client
                 .steer_turn(&active.thread_id, &active.turn_id, prompt)
@@ -507,35 +504,6 @@ impl Bot {
             }
         }
         Ok(())
-    }
-
-    async fn rollback_recent(
-        &mut self,
-        chat_id: i64,
-        num_turns: usize,
-        rerun_prompt: Option<(i64, String)>,
-    ) -> Result<(), String> {
-        self.clear_finished_task();
-        if self.active_turn.is_some() {
-            self.send_text(chat_id, "Codex 正在处理当前任务，请等待完成或点击停止。")
-                .await?;
-            return Ok(());
-        }
-        let Some(thread_id) = self.current_thread_id.clone() else {
-            self.send_text(chat_id, "当前没有已绑定的会话。").await?;
-            return Ok(());
-        };
-        app_server::rollback_thread(&self.config.codex_path, &thread_id, num_turns).await?;
-        match rerun_prompt {
-            Some((message_id, prompt)) if !prompt.trim().is_empty() => {
-                self.send_text(chat_id, "已撤回并重新生成。").await?;
-                self.ask(chat_id, message_id, prompt.trim()).await
-            }
-            _ => {
-                self.send_text_unit(chat_id, &format!("已撤回最近 {num_turns} 轮。"))
-                    .await
-            }
-        }
     }
 
     async fn send_thread_selected(
@@ -660,10 +628,6 @@ impl Bot {
                     { "text": "停止", "callback_data": "stop" }
                 ],
                 [
-                    { "text": "撤回 1 轮", "callback_data": "rollback:1" },
-                    { "text": "撤回 2 轮", "callback_data": "rollback:2" }
-                ],
-                [
                     { "text": "刷新", "callback_data": "menu" }
                 ]
             ]
@@ -676,10 +640,6 @@ impl Bot {
             .iter()
             .find_map(|(token, target)| (target.thread_id == thread_id).then(|| token.clone()));
         let mut rows = vec![
-            vec![
-                json!({ "text": "撤回 1 轮", "callback_data": "rollback:1" }),
-                json!({ "text": "撤回 2 轮", "callback_data": "rollback:2" }),
-            ],
             vec![json!({ "text": "返回菜单", "callback_data": "menu" })],
         ];
         if let Some(token) = token {

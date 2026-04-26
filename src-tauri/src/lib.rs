@@ -1,6 +1,7 @@
 pub mod app_server;
 mod bot_settings;
 mod codex_provider;
+mod config;
 
 use serde::Serialize;
 use tauri::image::Image;
@@ -10,7 +11,15 @@ use tauri::{AppHandle, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 
 const TRAY_ID: &str = "codex-manager-tray";
 const PROVIDER_MENU_PREFIX: &str = "codex-provider:";
-const CODEX_COMMAND: &str = "codex";
+fn resolve_codex_command() -> Result<String, String> {
+    let settings = bot_settings::read_settings(&bot_settings::default_env_path()?)?;
+    let path = settings.codex_path.trim();
+    if path.is_empty() {
+        Ok("codex".to_string())
+    } else {
+        Ok(path.to_string())
+    }
+}
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -128,14 +137,14 @@ fn activate_provider_from_tray(app: &AppHandle, id: &str) {
 async fn list_app_server_threads(
     limit: Option<usize>,
 ) -> Result<Vec<app_server::AppServerThread>, String> {
-    app_server::list_threads(CODEX_COMMAND, limit.unwrap_or(25)).await
+    app_server::list_threads(&resolve_codex_command()?, limit.unwrap_or(25)).await
 }
 
 #[tauri::command]
 async fn read_app_server_thread(
     thread_id: String,
 ) -> Result<app_server::AppServerThreadRead, String> {
-    app_server::read_thread(CODEX_COMMAND, &thread_id, true).await
+    app_server::read_thread(&resolve_codex_command()?, &thread_id, true).await
 }
 
 #[tauri::command]
@@ -145,7 +154,7 @@ async fn list_app_server_thread_turns(
     limit: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     app_server::list_thread_turns_compatible(
-        CODEX_COMMAND,
+        &resolve_codex_command()?,
         &thread_id,
         cursor.as_deref(),
         limit.unwrap_or(20),
@@ -155,7 +164,7 @@ async fn list_app_server_thread_turns(
 
 #[tauri::command]
 async fn archive_app_server_thread(thread_id: String) -> Result<(), String> {
-    app_server::archive_thread(CODEX_COMMAND, &thread_id).await
+    app_server::archive_thread(&resolve_codex_command()?, &thread_id).await
 }
 
 #[tauri::command]
@@ -166,7 +175,7 @@ fn list_codex_providers() -> Result<Vec<codex_provider::CodexProviderView>, Stri
 #[tauri::command]
 fn save_codex_provider(
     app: AppHandle,
-    provider: codex_provider::CodexProvider,
+    provider: config::CodexProvider,
 ) -> Result<codex_provider::CodexProviderView, String> {
     let saved = codex_provider::save_provider(&codex_provider::default_store_path()?, provider)?;
     refresh_tray_menu(&app);
