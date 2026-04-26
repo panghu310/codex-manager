@@ -1,16 +1,13 @@
 # CodexManager
 
-这是一个 macOS 菜单栏 Tauri App，用官方 `codex app-server` 管理本机 Codex 配置、会话和 Telegram 入口。
+这是一个管理本机 Codex 配置、会话和远程控制的 App, 目前只支持 Telegram bot
 
 ## 当前范围
 
-- Codex app-server 状态检查。
 - Codex 供应商管理：新增、编辑、删除、激活，激活时写入 `~/.codex/config.toml` 和 `~/.codex/auth.json`。
 - Codex 会话管理：通过 Codex app-server 的 `thread/list`、`thread/read`、`thread/archive` 获取、查看和归档会话。
 - Telegram Bot 配置：维护 `.runtime.env`，通过 launchd 重启本机 bot。
 - Telegram Bot 运行时：Rust 二进制 `telegram-codex-bot`，普通文本通过 app-server 发给 Codex，独立新对话不绑定目录，项目新对话使用项目 cwd。
-
-不包含 MCP/Skills 同步。
 
 ## 关键文件
 
