@@ -76,7 +76,7 @@ xattr -cr /Applications/CodexManager.app
 ### Telegram Bot 额外说明
 
 - `CODEX_BOT_DROP_PENDING_UPDATES` 默认开启。Bot 每次启动时会丢弃离线期间积压的 update，避免恢复后突然执行旧消息。
-- 当前 launchd label：`com.local.telegram-codex-bot`
+- 当前版本由 App 在进程内直接拉起 `telegram-codex-bot` sidecar，不依赖 `launchd` 或 `~/Library/LaunchAgents/*.plist`。
 
 ## 本地开发
 
@@ -116,9 +116,8 @@ npm run tauri -- build
 | `src-tauri/src/app_server.rs` | Codex app-server 客户端 |
 | `src-tauri/src/config.rs` | 统一配置管理 |
 | `src-tauri/src/codex_provider.rs` | 供应商管理 |
-| `src-tauri/src/bot_settings.rs` | TG Bot 配置与 launchd 控制 |
+| `src-tauri/src/bot_settings.rs` | TG Bot 配置与进程控制 |
 | `src-tauri/src/bin/telegram-codex-bot.rs` | TG Bot 运行时 |
-| `scripts/run-bot.sh` | Bot 启动脚本 |
 
 ## 验证
 

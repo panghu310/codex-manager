@@ -14,8 +14,10 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
+            target: x86_64-apple-darwin
             args: "--target x86_64-apple-darwin"
           - platform: macos-latest
+            target: aarch64-apple-darwin
             args: "--target aarch64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
@@ -35,11 +37,11 @@ jobs:
         run: npm install
 
       - name: Build telegram-codex-bot sidecar
+        working-directory: src-tauri
         run: |
           cargo build --release --bin telegram-codex-bot ${{ matrix.args }}
-          mkdir -p src-tauri/binaries
-          triple=$(rustc -vV | sed -n 's|host: ||p')
-          cp "target/${triple}/release/telegram-codex-bot" "src-tauri/binaries/telegram-codex-bot-${triple}"
+          mkdir -p binaries
+          cp "target/${{ matrix.target }}/release/telegram-codex-bot" "binaries/telegram-codex-bot-${{ matrix.target }}"
 
       - uses: tauri-apps/tauri-action@v0
         env:
