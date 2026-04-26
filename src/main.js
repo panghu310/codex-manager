@@ -19,6 +19,8 @@ import {
   summarizeAppServerStatus
 } from "./status.js";
 import { bindWindowDragging } from "./window-drag.js";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./styles.css";
 
 const app = document.querySelector("#app");
@@ -688,5 +690,21 @@ function escapeAttr(value) {
   return escapeHtml(value).replaceAll("'", "&#39;");
 }
 
+async function checkForUpdate() {
+  try {
+    const update = await check();
+    if (update?.available) {
+      const yes = confirm(`发现新版本 ${update.version}，是否立即下载并安装？`);
+      if (yes) {
+        await update.downloadAndInstall();
+        await relaunch();
+      }
+    }
+  } catch (err) {
+    console.error("检查更新失败:", err);
+  }
+}
+
+checkForUpdate();
 render();
 showProviders();
