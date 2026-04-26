@@ -246,6 +246,7 @@ function renderProviderEdit() {
       </div>
       <form id="provider-form" class="cc-form">
         <input type="hidden" name="id" value="${escapeAttr(provider?.id || "")}">
+        <input type="hidden" name="isOfficial" value="${provider?.isOfficial ? 'true' : ''}">
         <div class="form-grid two">
           <label>供应商名称<input name="name" value="${escapeAttr(provider?.name || "default")}" required></label>
           <label>备注<input name="note" placeholder="例如：公司专用账号"></label>
@@ -481,7 +482,8 @@ async function handleProviderSubmit(event) {
       baseUrl: form.get("baseUrl") || "",
       model: form.get("model") || "",
       apiKey: form.get("apiKey") || "",
-      configText: form.get("configText") || ""
+      configText: form.get("configText") || "",
+      isOfficial: form.get("isOfficial") === "true"
     });
     state.editingProviderId = saved?.id || id;
     state.message = "供应商已保存。";
@@ -538,6 +540,7 @@ function applyProviderPreset(id) {
   form.elements.model.value = preset.model;
   form.elements.apiKey.value = "";
   form.elements.configText.value = preset.configText || "";
+  form.elements.isOfficial.value = preset.isOfficial ? 'true' : '';
 }
 
 async function loadSessions() {

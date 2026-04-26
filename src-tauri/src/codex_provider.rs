@@ -16,6 +16,7 @@ pub struct CodexProviderView {
     pub config_text: String,
     pub rendered_config_text: String,
     pub active: bool,
+    pub is_official: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +123,10 @@ pub fn default_codex_dir() -> Result<PathBuf, String> {
 }
 
 pub fn render_provider_config(provider: &CodexProvider) -> String {
+    if provider.is_official {
+        return String::new();
+    }
+
     if let Some(text) = provider
         .config_text
         .as_deref()
@@ -209,6 +214,7 @@ fn to_view(provider: &CodexProvider, active_id: Option<&str>) -> CodexProviderVi
         config_text: provider.config_text.clone().unwrap_or_default(),
         rendered_config_text: render_provider_config(provider),
         active: active_id == Some(provider.id.as_str()),
+        is_official: provider.is_official,
     }
 }
 
@@ -286,6 +292,7 @@ mod tests {
             api_key: Some("sk-demo".to_string()),
             config_text: None,
             active: false,
+            is_official: false,
         };
 
         let text = render_provider_config(&provider);
@@ -307,6 +314,7 @@ mod tests {
             api_key: Some("sk-old".to_string()),
             config_text: None,
             active: false,
+            is_official: false,
         };
         save_provider(&store_path, first).expect("第一次保存");
 
@@ -320,6 +328,7 @@ mod tests {
                 api_key: Some(String::new()),
                 config_text: None,
                 active: false,
+                is_official: false,
             },
         )
         .expect("第二次保存");
@@ -342,6 +351,7 @@ mod tests {
             api_key: Some("sk-demo".to_string()),
             config_text: None,
             active: false,
+            is_official: false,
         };
         save_provider(&store_path, provider).expect("保存");
 

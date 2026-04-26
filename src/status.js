@@ -204,7 +204,8 @@ export function summarizeCodexProvider(provider) {
     renderedConfigText: provider?.renderedConfigText || provider?.rendered_config_text || provider?.configText || "",
     apiKeyMasked: provider?.apiKeyMasked || provider?.api_key_masked || maskSecret(provider?.apiKey),
     hasApiKey: Boolean(provider?.hasApiKey ?? provider?.has_api_key ?? provider?.apiKey),
-    active: Boolean(provider?.active)
+    active: Boolean(provider?.active),
+    isOfficial: Boolean(provider?.isOfficial ?? provider?.is_official)
   };
 }
 
@@ -216,7 +217,8 @@ export function codexProviderPresets() {
       baseUrl: "https://api.openai.com/v1",
       model: "gpt-5.4",
       apiKey: "",
-      configText: ""
+      configText: "",
+      isOfficial: true
     },
     {
       id: "custom_responses",

@@ -15,6 +15,8 @@ pub struct CodexProvider {
     pub config_text: Option<String>,
     #[serde(default)]
     pub active: bool,
+    #[serde(default)]
+    pub is_official: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
