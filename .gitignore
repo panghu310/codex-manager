@@ -48,6 +48,7 @@ coverage/
 
 # Tauri
 src-tauri/icons/icon.ico
+src-tauri/binaries/
 
 # Misc
 *.local

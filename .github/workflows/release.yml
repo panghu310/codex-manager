@@ -34,6 +34,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Build telegram-codex-bot sidecar
+        run: |
+          cargo build --release --bin telegram-codex-bot ${{ matrix.args }}
+          mkdir -p src-tauri/binaries
+          triple=$(rustc -vV | sed -n 's|host: ||p')
+          cp "target/${triple}/release/telegram-codex-bot" "src-tauri/binaries/telegram-codex-bot-${triple}"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -9,7 +9,9 @@
     "preview": "vite preview --host 127.0.0.1",
     "test": "node --test src/status.test.js",
     "tauri": "tauri",
-    "icons": "node scripts/generate-icons.mjs"
+    "icons": "node scripts/generate-icons.mjs",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "prepare:sidecar:release": "node scripts/prepare-sidecar.mjs --release"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.0",

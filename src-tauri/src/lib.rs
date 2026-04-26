@@ -221,13 +221,17 @@ fn save_bot_settings(
 }
 
 #[tauri::command]
-fn get_telegram_bot_status() -> Result<bot_settings::BotServiceStatus, String> {
-    Ok(bot_settings::service_status())
+fn get_telegram_bot_status(
+    state: tauri::State<bot_settings::BotManager>,
+) -> Result<bot_settings::BotServiceStatus, String> {
+    Ok(bot_settings::service_status(&state))
 }
 
 #[tauri::command]
-fn restart_telegram_bot() -> Result<bot_settings::BotServiceStatus, String> {
-    bot_settings::restart_service()
+fn restart_telegram_bot(
+    state: tauri::State<bot_settings::BotManager>,
+) -> Result<bot_settings::BotServiceStatus, String> {
+    bot_settings::restart_bot(&state)
 }
 
 #[tauri::command]
@@ -254,10 +258,11 @@ struct WindowDragStart {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .manage(bot_settings::BotManager::new())
         .invoke_handler(tauri::generate_handler![
             list_app_server_threads,
             read_app_server_thread,
@@ -306,8 +311,22 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            if let Some(state) = app.try_state::<bot_settings::BotManager>() {
+                if let Err(err) = bot_settings::start_bot(&state) {
+                    eprintln!("启动 Telegram Bot 失败：{err}");
+                }
+            }
+
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(state) = app_handle.try_state::<bot_settings::BotManager>() {
+                let _ = bot_settings::stop_bot(&state);
+            }
+        }
+    });
 }
