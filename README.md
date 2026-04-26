@@ -22,6 +22,18 @@
 - TG Bot 二进制入口：`src-tauri/src/bin/telegram-codex-bot.rs`
 - launchd 启动脚本：`scripts/run-bot.sh`
 
+## 下载安装
+
+从 [GitHub Releases](https://github.com/panghu310/codex-manager/releases) 下载最新版 `CodexManager.app`。
+
+macOS 首次打开时可能会提示「已损坏，无法打开」，这是因为未经过 Apple 公证。在终端执行以下命令即可：
+
+```sh
+xattr -cr /Applications/CodexManager.app
+```
+
+如果 App 还在下载目录，路径替换为 `~/Downloads/CodexManager.app`。
+
 ## 本地运行
 
 ```sh
