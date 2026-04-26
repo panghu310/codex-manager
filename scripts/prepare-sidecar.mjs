@@ -1,20 +1,37 @@
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
 const root = path.resolve(process.cwd());
 const binariesDir = path.join(root, "src-tauri", "binaries");
+const targetFlagIndex = process.argv.indexOf("--target");
+const explicitTarget =
+  targetFlagIndex >= 0 ? process.argv[targetFlagIndex + 1]?.trim() : "";
 
-const rustInfo = execSync("rustc -vV", { encoding: "utf8" });
-const targetMatch = /host: (\S+)/.exec(rustInfo);
-if (!targetMatch) {
-  console.error("无法获取 Rust target triple");
+if (targetFlagIndex >= 0 && !explicitTarget) {
+  console.error("--target 需要跟一个 Rust target triple");
   process.exit(1);
 }
-const targetTriple = targetMatch[1];
+
+let targetTriple = explicitTarget;
+if (!targetTriple) {
+  const rustInfo = execSync("rustc -vV", { encoding: "utf8" });
+  const targetMatch = /host: (\S+)/.exec(rustInfo);
+  if (!targetMatch) {
+    console.error("无法获取 Rust target triple");
+    process.exit(1);
+  }
+  targetTriple = targetMatch[1];
+}
 
 const profile = process.argv.includes("--release") ? "release" : "debug";
-const cargoArgs = process.argv.includes("--release") ? "--release" : "";
+const cargoArgs = ["build", "--bin", "telegram-codex-bot"];
+if (process.argv.includes("--release")) {
+  cargoArgs.push("--release");
+}
+if (explicitTarget) {
+  cargoArgs.push("--target", targetTriple);
+}
 
 fs.mkdirSync(binariesDir, { recursive: true });
 const dest = path.join(binariesDir, `telegram-codex-bot-${targetTriple}`);
@@ -25,12 +42,13 @@ if (!fs.existsSync(dest)) {
 }
 
 console.log(`构建 telegram-codex-bot (${profile})...`);
-execSync(`cargo build --bin telegram-codex-bot ${cargoArgs}`, {
+execFileSync("cargo", cargoArgs, {
   cwd: path.join(root, "src-tauri"),
   stdio: "inherit"
 });
 
-const src = path.join(root, "src-tauri", "target", profile, "telegram-codex-bot");
+const targetSegments = explicitTarget ? [targetTriple, profile] : [profile];
+const src = path.join(root, "src-tauri", "target", ...targetSegments, "telegram-codex-bot");
 if (!fs.existsSync(src)) {
   console.error(`构建产物不存在: ${src}`);
   process.exit(1);

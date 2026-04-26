@@ -92,18 +92,24 @@ test("README 不再声明 launchd plist 作为运行前提", () => {
   );
 });
 
-test("Release workflow 在 src-tauri 目录构建 sidecar，并使用矩阵 target 路径复制产物", () => {
+test("Release workflow 通过 prepare-sidecar 脚本为矩阵 target 准备 sidecar", () => {
   const workflow = read(".github/workflows/release.yml");
+  const prepareSidecar = read("scripts/prepare-sidecar.mjs");
 
   assert.match(
     workflow,
-    /working-directory:\s*src-tauri/,
-    "release workflow 没有在 src-tauri 目录执行 cargo build"
+    /node scripts\/prepare-sidecar\.mjs --release --target \$\{\{\s*matrix\.target\s*\}\}/,
+    "release workflow 没有通过 prepare-sidecar 脚本为矩阵 target 准备 sidecar"
   );
   assert.match(
-    workflow,
-    /cp "target\/\$\{\{\s*matrix\.target\s*\}\}\/release\/telegram-codex-bot"/,
-    "release workflow 没有从矩阵 target 对应目录复制 sidecar"
+    prepareSidecar,
+    /process\.argv\.(includes|indexOf)\("--target"\)/,
+    "prepare-sidecar 脚本还不支持显式 target"
+  );
+  assert.match(
+    prepareSidecar,
+    /const targetSegments = explicitTarget \? \[targetTriple, profile\] : \[profile\]/,
+    "prepare-sidecar 脚本没有从 target 三元组对应目录复制 sidecar 产物"
   );
 });
 

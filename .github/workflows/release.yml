@@ -37,11 +37,7 @@ jobs:
         run: npm install
 
       - name: Build telegram-codex-bot sidecar
-        working-directory: src-tauri
-        run: |
-          cargo build --release --bin telegram-codex-bot ${{ matrix.args }}
-          mkdir -p binaries
-          cp "target/${{ matrix.target }}/release/telegram-codex-bot" "binaries/telegram-codex-bot-${{ matrix.target }}"
+        run: node scripts/prepare-sidecar.mjs --release --target ${{ matrix.target }}
 
       - uses: tauri-apps/tauri-action@v0
         env:
