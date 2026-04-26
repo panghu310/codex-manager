@@ -3,6 +3,9 @@ node_modules/
 .pnp
 .pnp.js
 
+# Claude
+.claude/
+
 # Build outputs
 dist/
 src-tauri/target/
