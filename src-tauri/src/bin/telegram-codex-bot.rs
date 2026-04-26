@@ -1,4 +1,6 @@
-use codex_manager_lib::app_server;
+#[path = "../app_server.rs"]
+mod app_server;
+
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};

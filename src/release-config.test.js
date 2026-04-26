@@ -106,3 +106,18 @@ test("Release workflow 在 src-tauri 目录构建 sidecar，并使用矩阵 targ
     "release workflow 没有从矩阵 target 对应目录复制 sidecar"
   );
 });
+
+test("telegram-codex-bot 不通过桌面 lib 间接依赖 tauri", () => {
+  const botSource = read("src-tauri/src/bin/telegram-codex-bot.rs");
+
+  assert.equal(
+    botSource.includes("use codex_manager_lib::app_server;"),
+    false,
+    "telegram-codex-bot 仍然通过 codex_manager_lib 引入 app_server，会把 Tauri 桌面依赖带进 sidecar 构建"
+  );
+  assert.match(
+    botSource,
+    /#\[path = "\.\.\/app_server\.rs"\]\s+mod app_server;/,
+    "telegram-codex-bot 应直接复用 app_server.rs，避免 sidecar 构建编译桌面依赖"
+  );
+});
