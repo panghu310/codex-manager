@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -66,6 +66,23 @@ pub struct ThreadStatusChange {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadTokenUsageSummary {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub used_tokens: i64,
+    pub context_window: Option<i64>,
+    pub used_percent: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitSummary {
+    pub plan: Option<String>,
+    pub bucket: Option<String>,
+    pub used_percent: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistentAppServerClient {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -97,7 +114,11 @@ pub fn initialize_request() -> RpcRequest {
         Some(json!({
             "clientInfo": {
                 "name": "codex-manager",
+                "title": "CodexManager",
                 "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
             }
         })),
     )
@@ -213,6 +234,10 @@ pub fn thread_archive_request(thread_id: &str) -> RpcRequest {
     )
 }
 
+pub fn account_rate_limits_request() -> RpcRequest {
+    request("account/rateLimits/read", Some(json!({})))
+}
+
 pub fn standalone_cwd() -> Result<PathBuf, String> {
     let now = chrono::Local::now();
     let date = now.format("%Y-%m-%d").to_string();
@@ -249,6 +274,20 @@ pub async fn read_thread(
     )
     .await?;
     parse_thread_read_result(result)
+}
+
+pub async fn start_thread(codex_path: &str, cwd: Option<&str>) -> Result<String, String> {
+    let process_cwd = process_cwd(cwd)?;
+    let effective_cwd = effective_cwd(cwd, &process_cwd)?;
+    let result = call_once(
+        codex_path,
+        vec![
+            initialize_request(),
+            thread_start_request(Some(&effective_cwd)),
+        ],
+    )
+    .await?;
+    parse_thread_start_result(result)
 }
 
 pub async fn archive_thread(codex_path: &str, thread_id: &str) -> Result<(), String> {
@@ -343,17 +382,13 @@ pub async fn run_turn(
             let result = conn
                 .request(thread_start_request(Some(&effective_cwd)))
                 .await?;
-            result
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("thread/start 响应缺少 thread.id：{result}"))?
-                .to_string()
+            parse_thread_start_result(result)?
         }
     };
 
+    let turn_cwd = cwd.map(|_| effective_cwd.as_str());
     let result = conn
-        .request(turn_start_request(&thread_id, prompt, Some(&effective_cwd)))
+        .request(turn_start_request(&thread_id, prompt, turn_cwd))
         .await?;
     let turn_id = result
         .get("turn")
@@ -406,17 +441,13 @@ pub async fn run_turn_interruptible(
             let result = conn
                 .request(thread_start_request(Some(&effective_cwd)))
                 .await?;
-            result
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("thread/start 响应缺少 thread.id：{result}"))?
-                .to_string()
+            parse_thread_start_result(result)?
         }
     };
 
+    let turn_cwd = cwd.map(|_| effective_cwd.as_str());
     let result = conn
-        .request(turn_start_request(&thread_id, prompt, Some(&effective_cwd)))
+        .request(turn_start_request(&thread_id, prompt, turn_cwd))
         .await?;
     let turn_id = result
         .get("turn")
@@ -448,6 +479,22 @@ pub async fn run_turn_interruptible_persistent(
     started: oneshot::Sender<AppServerTurnHandle>,
     interrupt: oneshot::Receiver<oneshot::Sender<Result<(), String>>>,
 ) -> Result<AppServerTurnResult, String> {
+    run_turn_interruptible_persistent_with_progress(
+        client, thread_id, cwd, prompt, started, interrupt, true, None,
+    )
+    .await
+}
+
+pub async fn run_turn_interruptible_persistent_with_progress(
+    client: Arc<PersistentAppServerClient>,
+    thread_id: Option<&str>,
+    cwd: Option<&str>,
+    prompt: &str,
+    started: oneshot::Sender<AppServerTurnHandle>,
+    interrupt: oneshot::Receiver<oneshot::Sender<Result<(), String>>>,
+    resume_existing_thread: bool,
+    progress: Option<mpsc::UnboundedSender<String>>,
+) -> Result<AppServerTurnResult, String> {
     if prompt.trim().is_empty() {
         return Err("prompt is required".to_string());
     }
@@ -461,7 +508,7 @@ pub async fn run_turn_interruptible_persistent(
     let effective_cwd = effective_cwd(cwd, &fallback_cwd)?;
 
     let thread_id = match thread_id {
-        Some(id) if !id.trim().is_empty() => {
+        Some(id) if !id.trim().is_empty() && resume_existing_thread => {
             let trimmed = id.trim();
             match client.request(thread_resume_request(trimmed)).await {
                 Ok(result) => result
@@ -474,22 +521,19 @@ pub async fn run_turn_interruptible_persistent(
                 Err(err) => return Err(err),
             }
         }
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         _ => {
             let result = client
                 .request(thread_start_request(Some(&effective_cwd)))
                 .await?;
-            result
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("thread/start 响应缺少 thread.id：{result}"))?
-                .to_string()
+            parse_thread_start_result(result)?
         }
     };
 
     let mut events = client.subscribe();
+    let turn_cwd = cwd.map(|_| effective_cwd.as_str());
     let result = client
-        .request(turn_start_request(&thread_id, prompt, Some(&effective_cwd)))
+        .request(turn_start_request(&thread_id, prompt, turn_cwd))
         .await?;
     let turn_id = result
         .get("turn")
@@ -508,6 +552,7 @@ pub async fn run_turn_interruptible_persistent(
         &thread_id,
         &turn_id,
         interrupt,
+        progress,
     )
     .await?;
     Ok(AppServerTurnResult {
@@ -524,6 +569,7 @@ async fn read_persistent_turn_output_or_interrupt(
     thread_id: &str,
     turn_id: &str,
     interrupt: oneshot::Receiver<oneshot::Sender<Result<(), String>>>,
+    progress: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<TurnOutput, String> {
     let deadline = tokio::time::sleep(Duration::from_secs(120));
     tokio::pin!(deadline);
@@ -540,6 +586,9 @@ async fn read_persistent_turn_output_or_interrupt(
                         }
                         if let Some(delta) = agent_delta(&value) {
                             output.push_str(delta);
+                            if let Some(progress) = &progress {
+                                let _ = progress.send(delta.to_string());
+                            }
                         }
                         if value.get("method").and_then(Value::as_str) == Some("turn/completed") {
                             return Ok(TurnOutput { output, completed: true });
@@ -573,7 +622,10 @@ fn spawn_codex_command(codex_path: &str, process_cwd: &Path) -> Result<Child, St
         .stderr(std::process::Stdio::piped());
 
     if let Ok(current_path) = std::env::var("PATH") {
-        let mut extra = vec!["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()];
+        let mut extra = vec![
+            "/opt/homebrew/bin".to_string(),
+            "/usr/local/bin".to_string(),
+        ];
         if let Some(home) = dirs::home_dir() {
             extra.push(home.join(".local/bin").to_string_lossy().to_string());
         }
@@ -664,6 +716,20 @@ impl PersistentAppServerClient {
         self.request(turn_steer_request(thread_id, turn_id, prompt))
             .await
             .map(|_| ())
+    }
+
+    pub async fn start_thread(&self, cwd: Option<&str>) -> Result<String, String> {
+        let process_cwd = process_cwd(cwd)?;
+        let effective_cwd = effective_cwd(cwd, &process_cwd)?;
+        let result = self
+            .request(thread_start_request(Some(&effective_cwd)))
+            .await?;
+        parse_thread_start_result(result)
+    }
+
+    pub async fn read_rate_limits(&self) -> Result<Option<RateLimitSummary>, String> {
+        let result = self.request(account_rate_limits_request()).await?;
+        Ok(summarize_rate_limits(&result))
     }
 
     async fn write_json(&self, value: Value) -> Result<(), String> {
@@ -997,6 +1063,16 @@ pub fn parse_thread_list_result(result: Value) -> Result<Vec<AppServerThread>, S
     Err(format!("未知 thread/list 响应结构：{result}"))
 }
 
+pub fn parse_thread_start_result(result: Value) -> Result<String, String> {
+    result
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("thread/start 响应缺少 thread.id：{result}"))
+}
+
 pub fn parse_thread_turns_list_result(result: Value) -> Result<Vec<Value>, String> {
     if let Some(turns) = result
         .get("turns")
@@ -1034,6 +1110,80 @@ pub fn parse_thread_status_change(value: &Value) -> Option<ThreadStatusChange> {
             .or_else(|| params.get("thread").and_then(|thread| thread.get("status")))?,
     )?;
     Some(ThreadStatusChange { thread_id, status })
+}
+
+pub fn parse_thread_token_usage_update(value: &Value) -> Option<ThreadTokenUsageSummary> {
+    if value.get("method").and_then(Value::as_str) != Some("thread/tokenUsage/updated") {
+        return None;
+    }
+    let params = value.get("params")?;
+    let thread_id = params
+        .get("threadId")
+        .or_else(|| params.get("thread_id"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let turn_id = params
+        .get("turnId")
+        .or_else(|| params.get("turn_id"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let token_usage = params
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))?;
+    let used_tokens = token_usage
+        .get("total")
+        .and_then(|total| {
+            total
+                .get("totalTokens")
+                .or_else(|| total.get("total_tokens"))
+        })
+        .and_then(Value::as_i64)?;
+    let context_window = token_usage
+        .get("modelContextWindow")
+        .or_else(|| token_usage.get("model_context_window"))
+        .and_then(Value::as_i64);
+    let used_percent = context_window
+        .filter(|window| *window > 0)
+        .map(|window| ((used_tokens * 100) + (window / 2)) / window);
+    Some(ThreadTokenUsageSummary {
+        thread_id,
+        turn_id,
+        used_tokens,
+        context_window,
+        used_percent,
+    })
+}
+
+pub fn parse_rate_limits_update(value: &Value) -> Option<RateLimitSummary> {
+    if value.get("method").and_then(Value::as_str) != Some("account/rateLimits/updated") {
+        return None;
+    }
+    value.get("params").and_then(summarize_rate_limits)
+}
+
+pub fn summarize_rate_limits(value: &Value) -> Option<RateLimitSummary> {
+    let snapshots = if let Some(map) = value
+        .get("rateLimitsByLimitId")
+        .or_else(|| value.get("rate_limits_by_limit_id"))
+        .and_then(Value::as_object)
+    {
+        map.values().collect::<Vec<_>>()
+    } else if let Some(snapshot) = value
+        .get("rateLimits")
+        .or_else(|| value.get("rate_limits"))
+        .filter(|snapshot| snapshot.is_object())
+    {
+        vec![snapshot]
+    } else if value.get("primary").is_some() || value.get("secondary").is_some() {
+        vec![value]
+    } else {
+        Vec::new()
+    };
+
+    snapshots
+        .into_iter()
+        .filter_map(rate_limit_from_snapshot)
+        .max_by_key(|summary| summary.used_percent.unwrap_or_default())
 }
 
 pub fn normalize_thread_cwd(cwd: Option<String>) -> Option<String> {
@@ -1146,6 +1296,51 @@ fn status_value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn rate_limit_from_snapshot(snapshot: &Value) -> Option<RateLimitSummary> {
+    let primary = rate_limit_window(snapshot.get("primary"));
+    let secondary = rate_limit_window(snapshot.get("secondary"));
+    let selected = [primary, secondary]
+        .into_iter()
+        .flatten()
+        .max_by_key(|(percent, _)| *percent);
+    let (used_percent, resets_at) = selected.unwrap_or((0, None));
+    if used_percent == 0
+        && snapshot.get("limitName").is_none()
+        && snapshot.get("limitId").is_none()
+        && snapshot.get("planType").is_none()
+    {
+        return None;
+    }
+    Some(RateLimitSummary {
+        plan: value_string(snapshot, &["planType", "plan_type"]),
+        bucket: value_string(snapshot, &["limitName", "limit_name"])
+            .or_else(|| value_string(snapshot, &["limitId", "limit_id"])),
+        used_percent: Some(used_percent),
+        resets_at,
+    })
+}
+
+fn rate_limit_window(value: Option<&Value>) -> Option<(i64, Option<i64>)> {
+    let value = value?;
+    let used_percent = value
+        .get("usedPercent")
+        .or_else(|| value.get("used_percent"))
+        .and_then(Value::as_i64)?;
+    let resets_at = value
+        .get("resetsAt")
+        .or_else(|| value.get("resets_at"))
+        .and_then(Value::as_i64);
+    Some((used_percent, resets_at))
+}
+
+fn value_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 fn normalize_limit(limit: usize) -> usize {
     if limit == 0 {
         25
@@ -1243,6 +1438,23 @@ mod tests {
     }
 
     #[test]
+    fn initialize_request_declares_app_server_capabilities() {
+        let rpc = initialize_request();
+
+        let params = rpc.params.unwrap();
+        assert_eq!(params["clientInfo"]["name"], "codex-manager");
+        assert_eq!(params["capabilities"]["experimentalApi"], true);
+    }
+
+    #[test]
+    fn account_rate_limits_request_uses_app_server_method() {
+        let rpc = account_rate_limits_request();
+
+        assert_eq!(rpc.method, "account/rateLimits/read");
+        assert_eq!(rpc.params, Some(json!({})));
+    }
+
+    #[test]
     fn parse_thread_list_result_accepts_threads_key() {
         let threads = parse_thread_list_result(json!({
             "threads": [
@@ -1331,6 +1543,60 @@ mod tests {
                 status: "active:waitingOnApproval".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parse_thread_token_usage_update_reports_context_percent() {
+        let usage = parse_thread_token_usage_update(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 2500,
+                        "inputTokens": 1800,
+                        "cachedInputTokens": 1000,
+                        "outputTokens": 500,
+                        "reasoningOutputTokens": 200
+                    },
+                    "last": {
+                        "totalTokens": 300,
+                        "inputTokens": 200,
+                        "cachedInputTokens": 50,
+                        "outputTokens": 80,
+                        "reasoningOutputTokens": 20
+                    },
+                    "modelContextWindow": 10000
+                }
+            }
+        }))
+        .expect("usage");
+
+        assert_eq!(usage.thread_id, "thread-1");
+        assert_eq!(usage.turn_id, "turn-1");
+        assert_eq!(usage.used_tokens, 2500);
+        assert_eq!(usage.context_window, Some(10000));
+        assert_eq!(usage.used_percent, Some(25));
+    }
+
+    #[test]
+    fn summarize_rate_limits_picks_strictest_bucket() {
+        let summary = summarize_rate_limits(&json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitName": "Codex",
+                    "planType": "plus",
+                    "primary": { "usedPercent": 35, "windowDurationMins": 300, "resetsAt": 2000 },
+                    "secondary": { "usedPercent": 70, "windowDurationMins": 10080, "resetsAt": 3000 }
+                }
+            }
+        }))
+        .expect("summary");
+
+        assert_eq!(summary.plan.as_deref(), Some("plus"));
+        assert_eq!(summary.bucket.as_deref(), Some("Codex"));
+        assert_eq!(summary.used_percent, Some(70));
     }
 
     #[test]
@@ -1492,6 +1758,18 @@ mod tests {
 
         assert_eq!(rpc.method, "thread/start");
         assert_eq!(rpc.params, Some(json!({})));
+    }
+
+    #[test]
+    fn parse_thread_start_result_returns_thread_id() {
+        let thread_id = parse_thread_start_result(json!({
+            "thread": {
+                "id": "thread-precreated"
+            }
+        }))
+        .expect("parse");
+
+        assert_eq!(thread_id, "thread-precreated");
     }
 
     #[test]

@@ -4,11 +4,11 @@ mod app_server;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{oneshot, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
@@ -72,11 +72,14 @@ struct Bot {
     client: Client,
     current_thread_id: Option<String>,
     current_project_dir: Option<String>,
+    loaded_thread_ids: HashSet<String>,
     active_turn: Option<ActiveTurn>,
     active_interrupt: Option<oneshot::Sender<oneshot::Sender<Result<(), String>>>>,
     active_task: Option<JoinHandle<()>>,
     app_client: Arc<app_server::PersistentAppServerClient>,
     thread_statuses: Arc<Mutex<HashMap<String, String>>>,
+    token_usages: Arc<Mutex<HashMap<String, app_server::ThreadTokenUsageSummary>>>,
+    rate_limit: Arc<Mutex<Option<app_server::RateLimitSummary>>>,
     tracked_prompts: HashMap<(i64, i64), TrackedPrompt>,
     thread_tokens: HashMap<String, ThreadTarget>,
     project_tokens: HashMap<String, String>,
@@ -107,6 +110,57 @@ struct ThreadTarget {
     project_dir: Option<String>,
 }
 
+struct RuntimeStatusView {
+    running: bool,
+    current_context: String,
+    thread_status: Option<String>,
+    usage: Option<app_server::RateLimitSummary>,
+    token_usage: Option<app_server::ThreadTokenUsageSummary>,
+}
+
+struct StreamPreviewState {
+    interval_ms: u64,
+    min_delta_chars: usize,
+    max_chars: usize,
+    full_text: String,
+    last_sent_text: String,
+    last_sent_at_ms: Option<u64>,
+}
+
+impl StreamPreviewState {
+    fn new(interval_ms: u64, min_delta_chars: usize, max_chars: usize) -> Self {
+        Self {
+            interval_ms,
+            min_delta_chars,
+            max_chars,
+            full_text: String::new(),
+            last_sent_text: String::new(),
+            last_sent_at_ms: None,
+        }
+    }
+
+    fn push(&mut self, delta: &str, now_ms: u64) -> Option<String> {
+        self.full_text.push_str(delta);
+        let display_text = truncate(&self.full_text, self.max_chars);
+        let delta_chars = display_text
+            .chars()
+            .count()
+            .saturating_sub(self.last_sent_text.chars().count());
+        let interval_elapsed = self
+            .last_sent_at_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) >= self.interval_ms);
+        if delta_chars < self.min_delta_chars && !interval_elapsed {
+            return None;
+        }
+        if display_text == self.last_sent_text || display_text.trim().is_empty() {
+            return None;
+        }
+        self.last_sent_text = display_text.clone();
+        self.last_sent_at_ms = Some(now_ms);
+        Some(display_text)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -124,17 +178,27 @@ async fn run() -> Result<(), String> {
     let app_client =
         Arc::new(app_server::PersistentAppServerClient::start(&config.codex_path, None).await?);
     let thread_statuses = Arc::new(Mutex::new(HashMap::new()));
-    spawn_thread_status_listener(app_client.clone(), thread_statuses.clone());
+    let token_usages = Arc::new(Mutex::new(HashMap::new()));
+    let rate_limit = Arc::new(Mutex::new(None));
+    spawn_app_server_event_listener(
+        app_client.clone(),
+        thread_statuses.clone(),
+        token_usages.clone(),
+        rate_limit.clone(),
+    );
     let mut bot = Bot {
         config,
         client,
         current_thread_id: None,
         current_project_dir: None,
+        loaded_thread_ids: HashSet::new(),
         active_turn: None,
         active_interrupt: None,
         active_task: None,
         app_client,
         thread_statuses,
+        token_usages,
+        rate_limit,
         tracked_prompts: HashMap::new(),
         thread_tokens: HashMap::new(),
         project_tokens: HashMap::new(),
@@ -149,9 +213,11 @@ async fn run() -> Result<(), String> {
     bot.poll().await
 }
 
-fn spawn_thread_status_listener(
+fn spawn_app_server_event_listener(
     app_client: Arc<app_server::PersistentAppServerClient>,
     thread_statuses: Arc<Mutex<HashMap<String, String>>>,
+    token_usages: Arc<Mutex<HashMap<String, app_server::ThreadTokenUsageSummary>>>,
+    rate_limit: Arc<Mutex<Option<app_server::RateLimitSummary>>>,
 ) {
     tokio::spawn(async move {
         let mut events = app_client.subscribe();
@@ -163,6 +229,15 @@ fn spawn_thread_status_listener(
                             .lock()
                             .await
                             .insert(change.thread_id, change.status);
+                    }
+                    if let Some(usage) = app_server::parse_thread_token_usage_update(&value) {
+                        token_usages
+                            .lock()
+                            .await
+                            .insert(usage.thread_id.clone(), usage);
+                    }
+                    if let Some(summary) = app_server::parse_rate_limits_update(&value) {
+                        *rate_limit.lock().await = Some(summary);
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -395,7 +470,9 @@ impl Bot {
     }
 
     async fn start_new_thread(&mut self, chat_id: i64) -> Result<(), String> {
-        self.current_thread_id = None;
+        let thread_id = self.app_client.start_thread(None).await?;
+        self.loaded_thread_ids.insert(thread_id.clone());
+        self.current_thread_id = Some(thread_id);
         self.current_project_dir = None;
         self.send_text_unit(chat_id, "已切换到独立新对话。直接发送消息即可开始。")
             .await
@@ -407,7 +484,9 @@ impl Bot {
         project_dir: String,
     ) -> Result<(), String> {
         let project_name = project_label(&project_dir);
-        self.current_thread_id = None;
+        let thread_id = self.app_client.start_thread(Some(&project_dir)).await?;
+        self.loaded_thread_ids.insert(thread_id.clone());
+        self.current_thread_id = Some(thread_id);
         self.current_project_dir = Some(project_dir);
         self.send_text_unit(
             chat_id,
@@ -418,9 +497,13 @@ impl Bot {
 
     async fn ask(&mut self, chat_id: i64, message_id: i64, prompt: &str) -> Result<(), String> {
         self.clear_finished_task();
-        let is_new_thread = self.current_thread_id.is_none() && self.active_turn.is_none();
-        if is_new_thread {
-            self.send_text(chat_id, "当前未绑定对话，已为你开启新独立对话。").await?;
+        if self.active_turn.is_none() {
+            if let Some(notice) = new_thread_notice(
+                self.current_thread_id.as_deref(),
+                self.current_project_dir.as_deref(),
+            ) {
+                self.send_text(chat_id, notice).await?;
+            }
         }
         if let Some(active) = self.active_turn.clone() {
             self.app_client
@@ -434,25 +517,37 @@ impl Bot {
         let processing_message = self.send_text(chat_id, "正在处理...").await?;
         let app_client = self.app_client.clone();
         let thread_id = self.current_thread_id.clone();
+        let resume_existing_thread =
+            should_resume_thread(thread_id.as_deref(), &self.loaded_thread_ids);
         let cwd = self.current_project_dir.clone();
         let prompt = prompt.to_string();
         let tracked_key = (chat_id, message_id);
         let tracked_project_dir = cwd.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (interrupt_tx, interrupt_rx) = oneshot::channel();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let sender = TelegramSender { client, token };
-            match app_server::run_turn_interruptible_persistent(
+            let preview_task = spawn_stream_preview(
+                sender.clone(),
+                chat_id,
+                processing_message.message_id,
+                progress_rx,
+            );
+            match app_server::run_turn_interruptible_persistent_with_progress(
                 app_client,
                 thread_id.as_deref(),
                 cwd.as_deref(),
                 &prompt,
                 started_tx,
                 interrupt_rx,
+                resume_existing_thread,
+                Some(progress_tx),
             )
             .await
             {
                 Ok(result) => {
+                    preview_task.abort();
                     if !result.completed {
                         return;
                     }
@@ -473,6 +568,7 @@ impl Bot {
                     }
                 }
                 Err(err) => {
+                    preview_task.abort();
                     if let Err(send_err) = sender
                         .edit_text(
                             chat_id,
@@ -491,6 +587,7 @@ impl Bot {
         if let Ok(handle) = tokio::time::timeout(Duration::from_secs(8), started_rx).await {
             if let Ok(handle) = handle {
                 self.current_thread_id = Some(handle.thread_id.clone());
+                self.loaded_thread_ids.insert(handle.thread_id.clone());
                 self.tracked_prompts.insert(
                     tracked_key,
                     TrackedPrompt {
@@ -528,7 +625,7 @@ impl Bot {
                 "已切换到对话：{}\n项目：{}\n\n{}",
                 target.thread_id, project, history
             ),
-            Some(self.current_thread_keyboard(&target.thread_id)),
+            Some(Self::current_thread_keyboard()),
         )
         .await
         .map(|_| ())
@@ -628,32 +725,17 @@ impl Bot {
                     { "text": "新对话", "callback_data": "new" },
                     { "text": "状态", "callback_data": "status" },
                     { "text": "停止", "callback_data": "stop" }
-                ],
-                [
-                    { "text": "刷新", "callback_data": "menu" }
                 ]
             ]
         })
     }
 
-    fn current_thread_keyboard(&self, thread_id: &str) -> Value {
-        let token = self
-            .thread_tokens
-            .iter()
-            .find_map(|(token, target)| (target.thread_id == thread_id).then(|| token.clone()));
-        let mut rows = vec![
-            vec![json!({ "text": "返回菜单", "callback_data": "menu" })],
-        ];
-        if let Some(token) = token {
-            rows.insert(
-                1,
-                vec![json!({
-                    "text": "刷新历史",
-                    "callback_data": format!("history:{token}")
-                })],
-            );
-        }
-        json!({ "inline_keyboard": rows })
+    fn current_thread_keyboard() -> Value {
+        json!({
+            "inline_keyboard": [
+                [{ "text": "返回菜单", "callback_data": "menu" }]
+            ]
+        })
     }
 
     async fn send_projects(&mut self, chat_id: i64) -> Result<(), String> {
@@ -792,27 +874,33 @@ impl Bot {
     }
 
     async fn status_view(&self) -> MenuView {
-        let current_thread_status = match self.current_thread_id.as_deref() {
+        if let Ok(Some(summary)) = self.app_client.read_rate_limits().await {
+            *self.rate_limit.lock().await = Some(summary);
+        }
+        let current_thread_id = self.current_thread_id.as_deref();
+        let current_thread_status = match current_thread_id {
             Some(thread_id) => self.thread_statuses.lock().await.get(thread_id).cloned(),
             None => None,
         };
+        let token_usage = match current_thread_id {
+            Some(thread_id) => self.token_usages.lock().await.get(thread_id).cloned(),
+            None => None,
+        };
+        let usage = self.rate_limit.lock().await.clone();
         MenuView {
-            text: format!(
-                "状态：运行中\n当前对话：{}\n当前线程：{}",
-                current_context_label(
+            text: format_runtime_status(RuntimeStatusView {
+                running: true,
+                current_context: current_context_label(
                     self.current_thread_id.as_deref(),
-                    self.current_project_dir.as_deref()
-                )
-                .as_str(),
-                current_thread_status
-                    .as_deref()
-                    .map(status_label)
-                    .unwrap_or_else(|| "未知".to_string())
-            ),
+                    self.current_project_dir.as_deref(),
+                ),
+                thread_status: current_thread_status,
+                usage,
+                token_usage,
+            }),
             reply_markup: json!({
                 "inline_keyboard": [
-                    [{ "text": "返回菜单", "callback_data": "menu" }],
-                    [{ "text": "刷新", "callback_data": "status" }]
+                    [{ "text": "返回菜单", "callback_data": "menu" }]
                 ]
             }),
         }
@@ -989,9 +1077,35 @@ impl Bot {
     }
 }
 
+#[derive(Clone)]
 struct TelegramSender {
     client: Client,
     token: String,
+}
+
+fn spawn_stream_preview(
+    sender: TelegramSender,
+    chat_id: i64,
+    message_id: i64,
+    mut progress_rx: mpsc::UnboundedReceiver<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        let mut preview = StreamPreviewState::new(1500, 40, 1800);
+        while let Some(delta) = progress_rx.recv().await {
+            let now_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let Some(text) = preview.push(&delta, now_ms) else {
+                continue;
+            };
+            if let Err(err) = sender
+                .edit_text(chat_id, message_id, &format!("正在处理...\n\n{text}"))
+                .await
+            {
+                eprintln!("更新 Telegram 流式预览失败：{err}");
+                return;
+            }
+        }
+    })
 }
 
 impl TelegramSender {
@@ -1107,6 +1221,48 @@ fn status_label(status: &str) -> String {
         "cancelled" => "已取消".to_string(),
         value => value.to_string(),
     }
+}
+
+fn format_runtime_status(view: RuntimeStatusView) -> String {
+    let mut lines = vec![
+        format!(
+            "状态：{}",
+            if view.running {
+                "运行中"
+            } else {
+                "已停止"
+            }
+        ),
+        format!("当前对话：{}", view.current_context),
+        format!(
+            "当前线程：{}",
+            view.thread_status
+                .as_deref()
+                .map(status_label)
+                .unwrap_or_else(|| "未知".to_string())
+        ),
+    ];
+    if let Some(usage) = view.usage {
+        let bucket = usage.bucket.unwrap_or_else(|| "额度".to_string());
+        let plan = usage.plan.unwrap_or_else(|| "未知套餐".to_string());
+        let percent = usage
+            .used_percent
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "未知".to_string());
+        lines.push(format!("额度：{bucket} · {plan} · {percent}"));
+    }
+    if let Some(token_usage) = view.token_usage {
+        let context = match token_usage.context_window {
+            Some(window) if window > 0 => format!("{}/{}", token_usage.used_tokens, window),
+            _ => token_usage.used_tokens.to_string(),
+        };
+        let percent = token_usage
+            .used_percent
+            .map(|value| format!(" · {value}%"))
+            .unwrap_or_default();
+        lines.push(format!("上下文：{context}{percent}"));
+    }
+    lines.join("\n")
 }
 
 fn format_turn_history(turns: &[Value]) -> String {
@@ -1245,6 +1401,21 @@ fn current_context_label(thread_id: Option<&str>, project_dir: Option<&str>) -> 
         (None, Some(project_dir)) => format!("{} · 新对话", project_label(project_dir)),
         (None, None) => "未绑定".to_string(),
     }
+}
+
+fn new_thread_notice(thread_id: Option<&str>, project_dir: Option<&str>) -> Option<&'static str> {
+    if thread_id.is_none() && project_dir.is_none() {
+        Some("已切换到独立新对话。直接发送消息即可开始。")
+    } else {
+        None
+    }
+}
+
+fn should_resume_thread(thread_id: Option<&str>, loaded_thread_ids: &HashSet<String>) -> bool {
+    thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .is_some_and(|thread_id| !loaded_thread_ids.contains(thread_id))
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -1437,6 +1608,69 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), TELEGRAM_TEXT_CHUNK_LIMIT);
         assert_eq!(chunks[1].len(), 2);
+    }
+
+    #[test]
+    fn stream_preview_flushes_only_after_min_delta_or_interval() {
+        let mut preview = StreamPreviewState::new(1500, 8, 120);
+
+        assert_eq!(preview.push("短", 0), None);
+        assert_eq!(preview.push("消息", 200), None);
+        assert_eq!(
+            preview.push("，这次足够长", 400).as_deref(),
+            Some("短消息，这次足够长")
+        );
+        assert_eq!(preview.push("追加", 600), None);
+        assert_eq!(
+            preview.push("内容", 2100).as_deref(),
+            Some("短消息，这次足够长追加内容")
+        );
+    }
+
+    #[test]
+    fn format_runtime_status_includes_usage_and_context() {
+        let text = format_runtime_status(RuntimeStatusView {
+            running: true,
+            current_context: "demo · thread-1".to_string(),
+            thread_status: Some("active:waitingOnApproval".to_string()),
+            usage: Some(app_server::RateLimitSummary {
+                plan: Some("plus".to_string()),
+                bucket: Some("Codex".to_string()),
+                used_percent: Some(70),
+                resets_at: Some(3000),
+            }),
+            token_usage: Some(app_server::ThreadTokenUsageSummary {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                used_tokens: 2500,
+                context_window: Some(10000),
+                used_percent: Some(25),
+            }),
+        });
+
+        assert!(text.contains("状态：运行中"));
+        assert!(text.contains("当前线程：等待确认"));
+        assert!(text.contains("额度：Codex · plus · 70%"));
+        assert!(text.contains("上下文：2500/10000 · 25%"));
+    }
+
+    #[test]
+    fn new_thread_notice_respects_project_context() {
+        assert_eq!(new_thread_notice(None, Some("/work/codex-manager")), None);
+        assert_eq!(
+            new_thread_notice(None, None),
+            Some("已切换到独立新对话。直接发送消息即可开始。")
+        );
+        assert_eq!(new_thread_notice(Some("thread-1"), None), None);
+    }
+
+    #[test]
+    fn should_resume_thread_skips_loaded_threads() {
+        let loaded = HashSet::from(["thread-precreated".to_string()]);
+
+        assert!(!should_resume_thread(Some("thread-precreated"), &loaded));
+        assert!(should_resume_thread(Some("thread-from-history"), &loaded));
+        assert!(!should_resume_thread(None, &loaded));
     }
 
     #[test]
