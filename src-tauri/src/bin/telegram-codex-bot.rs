@@ -2064,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_preview_renders_processing_header_text_and_summary_sections() {
+    fn stream_preview_renders_state_body_text_and_summary_sections() {
         let mut preview = StreamPreviewState::new(1500, 4, 240);
 
         let rendered = preview
@@ -2077,7 +2077,7 @@ mod tests {
             )
             .expect("should render");
 
-        assert_eq!(rendered, "正在处理...\n\n我先查看和消息展示有关的入口。");
+        assert_eq!(rendered, "Codex：我先查看和消息展示有关的入口。");
     }
 
     #[test]
@@ -2094,7 +2094,7 @@ mod tests {
                 },
                 0,
             ),
-            Some("正在处理...\n\nran 1 commands".to_string())
+            Some("ran 1 commands".to_string())
         );
 
         assert_eq!(
@@ -2107,7 +2107,7 @@ mod tests {
                 },
                 100,
             ),
-            Some("正在处理...\n\n已探索 1 次搜索\nran 1 commands".to_string())
+            Some("已探索 1 次搜索\nran 1 commands".to_string())
         );
     }
 
@@ -2127,7 +2127,7 @@ mod tests {
             )
             .expect("should render");
 
-        assert_eq!(rendered, "正在处理...\n\n已编辑 1 个文件");
+        assert_eq!(rendered, "已编辑 1 个文件");
     }
 
     #[test]
@@ -2225,30 +2225,6 @@ mod tests {
                     ]
                 ]
             })
-        );
-    }
-
-    #[test]
-    fn stream_preview_keeps_processing_header_when_waiting_for_approval() {
-        let mut preview = StreamPreviewState::new(1500, 4, 240);
-
-        let rendered = preview
-            .push_progress(
-                app_server::TurnProgress::ApprovalRequested {
-                    request_id: 42,
-                    label: "Shell".to_string(),
-                },
-                0,
-            )
-            .expect("should render");
-
-        assert_eq!(rendered, "正在处理...\n\n等待审批 Shell");
-        assert_eq!(
-            progress_reply_markup(&app_server::TurnProgress::ApprovalRequested {
-                request_id: 42,
-                label: "Shell".to_string(),
-            }),
-            Some(approval_keyboard(42))
         );
     }
 
