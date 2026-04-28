@@ -125,10 +125,35 @@ struct StreamPreviewState {
     max_chars: usize,
     pending_delta_text: String,
     agent_messages: Vec<(String, String)>,
+    active_tool_lines: Vec<(String, String)>,
+    notice_lines: Vec<String>,
     summary_lines: Vec<String>,
+    explored_searches: usize,
+    edited_files: usize,
+    command_runs: usize,
     last_sent_text: String,
     last_sent_agent_chars: usize,
     last_sent_at_ms: Option<u64>,
+}
+
+enum ToolSummaryKind {
+    Command,
+    Search,
+    Edit,
+    None,
+}
+
+fn classify_tool_summary_kind(label: &str) -> ToolSummaryKind {
+    let label = label.trim();
+    if label.starts_with("Shell") {
+        ToolSummaryKind::Command
+    } else if label.starts_with("Web 搜索") {
+        ToolSummaryKind::Search
+    } else if label.starts_with("修改文件") {
+        ToolSummaryKind::Edit
+    } else {
+        ToolSummaryKind::None
+    }
 }
 
 impl StreamPreviewState {
@@ -139,7 +164,12 @@ impl StreamPreviewState {
             max_chars,
             pending_delta_text: String::new(),
             agent_messages: Vec::new(),
+            active_tool_lines: Vec::new(),
+            notice_lines: Vec::new(),
             summary_lines: Vec::new(),
+            explored_searches: 0,
+            edited_files: 0,
+            command_runs: 0,
             last_sent_text: String::new(),
             last_sent_agent_chars: 0,
             last_sent_at_ms: None,
@@ -156,34 +186,35 @@ impl StreamPreviewState {
                 self.upsert_agent_message(item_id, text);
                 true
             }
-            app_server::TurnProgress::ToolStarted { label, .. } => {
-                self.push_summary_line(format!("正在调用 {label}"));
+            app_server::TurnProgress::ToolStarted { item_id, label } => {
+                self.upsert_active_tool_line(item_id, format!("正在调用 {label}"));
                 true
             }
             app_server::TurnProgress::ToolCompleted {
+                item_id,
                 label,
                 success,
                 summary: _,
                 ..
             } => {
-                let suffix = match success {
-                    Some(true) => "已调用完成",
-                    Some(false) => "调用失败",
-                    None => "调用结束",
-                };
-                self.push_summary_line(format!("{label} {suffix}"));
+                self.remove_active_tool_line(&item_id);
+                match success {
+                    Some(true) => self.record_tool_completion(&label),
+                    Some(false) => self.push_notice_line(format!("{label} 调用失败")),
+                    None => self.push_notice_line(format!("{label} 调用结束")),
+                }
                 true
             }
             app_server::TurnProgress::ApprovalRequested { label, .. } => {
-                self.push_summary_line(format!("等待审批 {label}"));
+                self.push_notice_line(format!("等待审批 {label}"));
                 true
             }
             app_server::TurnProgress::ApprovalResolved { .. } => {
-                self.push_summary_line("审批已处理".to_string());
+                self.push_notice_line("审批已处理".to_string());
                 true
             }
             app_server::TurnProgress::ClientRequestHandled { label, .. } => {
-                self.push_summary_line(label);
+                self.push_notice_line(label);
                 true
             }
         };
@@ -212,15 +243,65 @@ impl StreamPreviewState {
         self.pending_delta_text.push_str(&delta);
     }
 
-    fn push_summary_line(&mut self, line: String) {
-        if self.summary_lines.last() == Some(&line) {
+    fn upsert_active_tool_line(&mut self, item_id: String, line: String) {
+        if let Some((_, existing)) = self
+            .active_tool_lines
+            .iter_mut()
+            .find(|(existing_id, _)| existing_id == &item_id)
+        {
+            *existing = line;
+            self.rebuild_summary_lines();
             return;
         }
-        self.summary_lines.push(line);
-        let keep_from = self.summary_lines.len().saturating_sub(8);
-        if keep_from > 0 {
-            self.summary_lines.drain(..keep_from);
+        self.active_tool_lines.push((item_id, line));
+        self.rebuild_summary_lines();
+    }
+
+    fn remove_active_tool_line(&mut self, item_id: &str) {
+        self.active_tool_lines
+            .retain(|(existing_id, _)| existing_id != item_id);
+        self.rebuild_summary_lines();
+    }
+
+    fn push_notice_line(&mut self, line: String) {
+        if self.notice_lines.last() == Some(&line) {
+            return;
         }
+        self.notice_lines.push(line);
+        let keep_from = self.notice_lines.len().saturating_sub(8);
+        if keep_from > 0 {
+            self.notice_lines.drain(..keep_from);
+        }
+        self.rebuild_summary_lines();
+    }
+
+    fn record_tool_completion(&mut self, label: &str) {
+        match classify_tool_summary_kind(label) {
+            ToolSummaryKind::Command => self.command_runs += 1,
+            ToolSummaryKind::Search => self.explored_searches += 1,
+            ToolSummaryKind::Edit => self.edited_files += 1,
+            ToolSummaryKind::None => self.push_notice_line(format!("{label} 已调用完成")),
+        }
+        self.rebuild_summary_lines();
+    }
+
+    fn rebuild_summary_lines(&mut self) {
+        let mut lines = self
+            .active_tool_lines
+            .iter()
+            .map(|(_, line)| line.clone())
+            .collect::<Vec<_>>();
+        lines.extend(self.notice_lines.iter().cloned());
+        if self.explored_searches > 0 {
+            lines.push(format!("已探索 {} 次搜索", self.explored_searches));
+        }
+        if self.edited_files > 0 {
+            lines.push(format!("已编辑 {} 个文件", self.edited_files));
+        }
+        if self.command_runs > 0 {
+            lines.push(format!("ran {} commands", self.command_runs));
+        }
+        self.summary_lines = lines;
     }
 
     fn render_progress_body(&self) -> String {
@@ -2235,7 +2316,7 @@ mod tests {
                     100
                 )
                 .as_deref(),
-            Some("正在调用 Shell\nShell 已调用完成")
+            Some("ran 1 commands")
         );
     }
 
