@@ -129,10 +129,6 @@ struct StreamPreviewState {
     last_sent_text: String,
     last_sent_agent_chars: usize,
     last_sent_at_ms: Option<u64>,
-    explored_files: usize,
-    explored_searches: usize,
-    edited_files: usize,
-    command_runs: usize,
 }
 
 impl StreamPreviewState {
@@ -147,10 +143,6 @@ impl StreamPreviewState {
             last_sent_text: String::new(),
             last_sent_agent_chars: 0,
             last_sent_at_ms: None,
-            explored_files: 0,
-            explored_searches: 0,
-            edited_files: 0,
-            command_runs: 0,
         }
     }
 
@@ -174,7 +166,6 @@ impl StreamPreviewState {
                 summary: _,
                 ..
             } => {
-                self.record_tool_completion(&label);
                 let suffix = match success {
                     Some(true) => "已调用完成",
                     Some(false) => "调用失败",
@@ -233,12 +224,6 @@ impl StreamPreviewState {
     }
 
     fn render_progress_body(&self) -> String {
-        let _ = (
-            self.explored_files,
-            self.explored_searches,
-            self.edited_files,
-            self.command_runs,
-        );
         let mut parts = Vec::new();
         let text = truncate(&self.process_text(), self.max_chars);
         if !text.trim().is_empty() {
@@ -281,18 +266,6 @@ impl StreamPreviewState {
             }
         }
         sections.join("\n\n")
-    }
-
-    fn record_tool_completion(&mut self, label: &str) {
-        if label == "Shell" {
-            self.command_runs += 1;
-        }
-        if label.contains("搜索") {
-            self.explored_searches += 1;
-        }
-        if label.contains("修改文件") {
-            self.edited_files += 1;
-        }
     }
 }
 
@@ -2067,6 +2040,38 @@ mod tests {
                 .as_deref(),
             Some("Codex：完整回复继续")
         );
+    }
+
+    #[test]
+    fn stream_preview_message_clears_pending_delta_state() {
+        let mut preview = StreamPreviewState::new(1500, 4, 120);
+
+        assert_eq!(
+            preview
+                .push_progress(app_server::TurnProgress::Delta("临时草稿".to_string()), 0)
+                .as_deref(),
+            Some("Codex：临时草稿")
+        );
+        assert_eq!(preview.pending_delta_text, "临时草稿");
+
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Message {
+                        item_id: "message-1".to_string(),
+                        text: "正式回复".to_string(),
+                    },
+                    100,
+                )
+                .as_deref(),
+            Some("Codex：正式回复")
+        );
+        assert!(preview.pending_delta_text.is_empty());
+        assert_eq!(
+            preview.agent_messages,
+            vec![("message-1".to_string(), "正式回复".to_string())]
+        );
+        assert_eq!(preview.process_text(), "正式回复");
     }
 
     #[test]
