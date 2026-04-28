@@ -2064,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_preview_renders_state_body_text_and_summary_sections() {
+    fn stream_preview_renders_state_body_text() {
         let mut preview = StreamPreviewState::new(1500, 4, 240);
 
         let rendered = preview
