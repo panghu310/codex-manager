@@ -10,7 +10,6 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "macOSPrivateApi": true,
     "withGlobalTauri": false,
     "windows": [
       {
@@ -22,7 +21,6 @@
         "minWidth": 860,
         "minHeight": 560,
         "resizable": true,
-        "transparent": true,
         "fullscreen": false,
         "center": true,
         "visible": true,

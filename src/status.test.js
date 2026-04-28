@@ -197,6 +197,7 @@ test("summarizeAppServerStatus 汇总 app-server 状态", () => {
   assert.equal(status.latestUpdatedAt, 300);
 });
 
+
 test("groupThreadsForMenu 按项目和独立对话分组", () => {
   const menu = groupThreadsForMenu([
     { id: "p1-s1", title: "session-1", cwd: "/work/codex-bot", updatedAt: 3 },

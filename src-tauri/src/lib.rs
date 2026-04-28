@@ -24,6 +24,9 @@ fn resolve_codex_command() -> Result<String, String> {
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -33,6 +36,11 @@ fn hide_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
+}
+
+#[cfg(target_os = "macos")]
+fn should_restore_main_window_on_reopen(has_visible_windows: bool) -> bool {
+    !has_visible_windows
 }
 
 fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
@@ -295,12 +303,12 @@ pub fn run() {
             move_window_to
         ])
         .setup(|app| {
-            let prompts = startup_permissions::request_startup_permissions();
-            if prompts.screen_capture_requested {
-                eprintln!("已请求 macOS 屏幕录制权限");
+            let permissions = startup_permissions::check_startup_permissions();
+            if !permissions.screen_capture_granted {
+                eprintln!("macOS 屏幕录制权限未授权，启动时不主动申请");
             }
-            if prompts.accessibility_prompted {
-                eprintln!("已请求 macOS 辅助功能权限");
+            if !permissions.accessibility_trusted {
+                eprintln!("macOS 辅助功能权限未授权，启动时不主动申请");
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -344,11 +352,39 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
 
-    app.run(|app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } => {
+            if should_restore_main_window_on_reopen(has_visible_windows) {
+                show_main_window(app_handle);
+            }
+        }
+        tauri::RunEvent::Exit => {
             if let Some(state) = app_handle.try_state::<bot_settings::BotManager>() {
                 let _ = bot_settings::stop_bot(&state);
             }
         }
+        _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    use super::should_restore_main_window_on_reopen;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reopen_with_hidden_windows_should_restore_main_window() {
+        assert!(should_restore_main_window_on_reopen(false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reopen_with_visible_windows_should_not_force_restore() {
+        assert!(!should_restore_main_window_on_reopen(true));
+    }
 }

@@ -31,7 +31,7 @@ import "./styles.css";
 const app = document.querySelector("#app");
 
 const state = {
-  view: "providers",
+  view: "status",
   loading: false,
   status: summarizeAppServerStatus([]),
   providers: [],
@@ -45,8 +45,10 @@ const state = {
   message: "",
   error: ""
 };
+let statusPageScrollTop = 0;
 
 function render() {
+  rememberStatusPageScroll();
   rememberSessionListScroll();
   app.innerHTML = `
     <main class="cc-window">
@@ -60,6 +62,7 @@ function render() {
   `;
   bindEvents();
   restoreSessionListScroll();
+  restoreStatusPageScroll();
 }
 
 function renderView() {
@@ -85,6 +88,21 @@ function restoreSessionListScroll() {
   }
 }
 
+function rememberStatusPageScroll() {
+  const panel = document.querySelector(".status-page");
+  if (panel) {
+    statusPageScrollTop = panel.scrollTop;
+  }
+}
+
+function restoreStatusPageScroll() {
+  if (state.view !== "status") return;
+  const panel = document.querySelector(".status-page");
+  if (panel) {
+    panel.scrollTop = statusPageScrollTop;
+  }
+}
+
 function renderNotice() {
   return `
     ${state.message ? `<p class="toast success">${escapeHtml(state.message)}</p>` : ""}
@@ -98,9 +116,9 @@ function renderSidebar() {
       <div class="sidebar-drag-layer" data-window-drag></div>
       <nav class="side-nav" aria-label="主导航">
         <button type="button" class="${state.view === "status" ? "selected" : ""}" data-action="status"><span>⌂</span>状态</button>
-        <button type="button" class="${state.view === "providers" || state.view === "provider-edit" ? "selected" : ""}" data-action="home"><span>▣</span>供应</button>
+        <button type="button" class="${state.view === "providers" || state.view === "provider-edit" ? "selected" : ""}" data-action="home"><span>◫</span>供应</button>
         <button type="button" class="${state.view === "sessions" ? "selected" : ""}" data-action="sessions"><span>▱</span>会话</button>
-        <button type="button" class="${state.view === "settings" ? "selected" : ""}" data-action="settings"><span>⚙</span>设置</button>
+        <button type="button" class="${state.view === "settings" ? "selected" : ""}" data-action="settings"><span>◎</span>设置</button>
       </nav>
       <div class="runtime-card">
         <span><i></i>运行中</span>
@@ -156,35 +174,36 @@ function renderProviderHome() {
 
 function renderStatusPage() {
   const status = state.status;
+  const botDetail = status.botDetail || (status.botRunning ? "服务已配置并运行中" : status.botConfigured ? "服务已配置但未运行" : "尚未配置 Telegram Bot");
   return `
     ${renderPageHeader("状态", "Codex app-server 与 Bot 的运行概览。", `<button type="button" class="secondary-button" data-action="refresh">↻ 刷新状态</button>`)}
     <section class="status-page">
-      <article class="status-card ${status.connected ? "ok" : "bad"}">
-        <div class="pulse-icon">⌁</div>
+      <article class="status-card hero-status ${status.connected ? "ok" : "bad"}">
+        <div class="pulse-icon bolt-icon" aria-hidden="true"><i></i></div>
         <div class="status-main">
-          <div>
+          <div class="status-title-row">
             <span>Codex app-server</span>
-            <strong>${status.connected ? "运行中" : "离线"}</strong>
+            <b class="status-chip ${status.connected ? "lime" : "coral"}">${status.connected ? "运行中" : "离线"}</b>
           </div>
           <p>端口 8765 · 最近更新 ${formatDateTime(status.latestUpdatedAt)}</p>
         </div>
       </article>
       <div class="status-grid">
-        <div><span>对话</span><strong>${status.threadCount}</strong><small>次</small></div>
-        <div><span>项目</span><strong>${status.projectCount}</strong><small>个</small></div>
-        <div><span>最近更新</span><strong>${formatShortTime(status.latestUpdatedAt)}</strong><small>${formatShortDate(status.latestUpdatedAt)}</small></div>
+        <div><span>对话</span><strong>${status.threadCount}</strong><small>次</small><i class="metric-icon">▱</i></div>
+        <div><span>项目</span><strong>${status.projectCount}</strong><small>个</small><i class="metric-icon">▣</i></div>
+        <div><span>最近更新</span><strong>${formatShortTime(status.latestUpdatedAt)}</strong><small>${formatShortDate(status.latestUpdatedAt)}</small><i class="metric-icon">◷</i></div>
       </div>
-      <article class="status-card" style="margin-top:10px">
-        <div class="pulse-icon">◎</div>
+      <article class="status-card bot-card">
+        <div class="pulse-icon ring-icon" aria-hidden="true"></div>
         <div class="status-main">
-          <div>
+          <div class="status-title-row">
             <span>Telegram Bot</span>
-            <strong>${status.botRunning ? "运行中" : status.botConfigured ? "已停止" : "未配置"}</strong>
+            <b class="status-chip ${status.botRunning ? "lime" : "coral"}">${status.botRunning ? "运行中" : status.botConfigured ? "已停止" : "未配置"}</b>
           </div>
-          <p>${escapeHtml(status.botDetail)}</p>
+          <p>${escapeHtml(botDetail)}</p>
         </div>
       </article>
-      <div class="lower-grid" style="margin-top:10px">
+      <div class="lower-grid">
         <article class="panel-card">
           <header><strong>最近活动</strong></header>
           <ul class="activity-list">
@@ -196,10 +215,10 @@ function renderStatusPage() {
         <article class="panel-card">
           <header><strong>健康检查</strong></header>
           <div class="health-list">
-            <p><span>● Admin 连接</span><b>${status.connected ? "正常" : "异常"}</b></p>
-            <p><span>● App-server</span><b>${status.connected ? "在线" : "离线"}</b></p>
-            <p><span>● Telegram Bot</span><b>${status.botRunning ? "正常" : status.botConfigured ? "已停止" : "未配置"}</b></p>
-            <p><span>● 配置读取</span><b>成功</b></p>
+            <p><span><i class="${status.connected ? "check-dot" : "alert-dot"}"></i>Admin 连接</span><b class="${status.connected ? "lime-badge" : "coral-badge"}">${status.connected ? "正常" : "异常"}</b></p>
+            <p><span><i class="${status.connected ? "check-dot" : "alert-dot"}"></i>App-server</span><b class="${status.connected ? "lime-badge" : "coral-badge"}">${status.connected ? "在线" : "离线"}</b></p>
+            <p><span><i class="${status.botRunning ? "check-dot" : "alert-dot"}"></i>Telegram Bot</span><b class="${status.botRunning ? "lime-badge" : "coral-badge"}">${status.botRunning ? "正常" : status.botConfigured ? "已停止" : "未配置"}</b></p>
+            <p><span><i class="check-dot"></i>配置读取</span><b class="lime-badge">成功</b></p>
           </div>
         </article>
       </div>
@@ -803,4 +822,4 @@ async function checkForUpdate() {
 
 checkForUpdate();
 render();
-showProviders();
+showStatus();
