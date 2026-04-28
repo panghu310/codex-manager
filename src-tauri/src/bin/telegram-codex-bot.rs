@@ -123,12 +123,16 @@ struct StreamPreviewState {
     interval_ms: u64,
     min_delta_chars: usize,
     max_chars: usize,
-    full_text: String,
+    pending_delta_text: String,
     agent_messages: Vec<(String, String)>,
-    activity_lines: Vec<String>,
+    summary_lines: Vec<String>,
     last_sent_text: String,
     last_sent_agent_chars: usize,
     last_sent_at_ms: Option<u64>,
+    explored_files: usize,
+    explored_searches: usize,
+    edited_files: usize,
+    command_runs: usize,
 }
 
 impl StreamPreviewState {
@@ -137,19 +141,23 @@ impl StreamPreviewState {
             interval_ms,
             min_delta_chars,
             max_chars,
-            full_text: String::new(),
+            pending_delta_text: String::new(),
             agent_messages: Vec::new(),
-            activity_lines: Vec::new(),
+            summary_lines: Vec::new(),
             last_sent_text: String::new(),
             last_sent_agent_chars: 0,
             last_sent_at_ms: None,
+            explored_files: 0,
+            explored_searches: 0,
+            edited_files: 0,
+            command_runs: 0,
         }
     }
 
     fn push_progress(&mut self, progress: app_server::TurnProgress, now_ms: u64) -> Option<String> {
         let force = match progress {
             app_server::TurnProgress::Delta(delta) => {
-                self.full_text.push_str(&delta);
+                self.push_delta_text(delta);
                 false
             }
             app_server::TurnProgress::Message { item_id, text } => {
@@ -157,7 +165,7 @@ impl StreamPreviewState {
                 true
             }
             app_server::TurnProgress::ToolStarted { label, .. } => {
-                self.push_activity(format!("正在调用 {label}"));
+                self.push_summary_line(format!("正在调用 {label}"));
                 true
             }
             app_server::TurnProgress::ToolCompleted {
@@ -166,30 +174,31 @@ impl StreamPreviewState {
                 summary: _,
                 ..
             } => {
+                self.record_tool_completion(&label);
                 let suffix = match success {
                     Some(true) => "已调用完成",
                     Some(false) => "调用失败",
                     None => "调用结束",
                 };
-                self.push_activity(format!("{label} {suffix}"));
+                self.push_summary_line(format!("{label} {suffix}"));
                 true
             }
             app_server::TurnProgress::ApprovalRequested { label, .. } => {
-                self.push_activity(format!("等待审批 {label}"));
+                self.push_summary_line(format!("等待审批 {label}"));
                 true
             }
             app_server::TurnProgress::ApprovalResolved { .. } => {
-                self.push_activity("审批已处理".to_string());
+                self.push_summary_line("审批已处理".to_string());
                 true
             }
             app_server::TurnProgress::ClientRequestHandled { label, .. } => {
-                self.push_activity(label);
+                self.push_summary_line(label);
                 true
             }
         };
-        let display_text = self.render_progress();
+        let display_text = self.render_progress_body();
         let delta_chars = self
-            .full_text
+            .process_text()
             .chars()
             .count()
             .saturating_sub(self.last_sent_agent_chars);
@@ -203,30 +212,40 @@ impl StreamPreviewState {
             return None;
         }
         self.last_sent_text = display_text.clone();
-        self.last_sent_agent_chars = self.full_text.chars().count();
+        self.last_sent_agent_chars = self.process_text().chars().count();
         self.last_sent_at_ms = Some(now_ms);
         Some(display_text)
     }
 
-    fn push_activity(&mut self, line: String) {
-        if self.activity_lines.last() == Some(&line) {
+    fn push_delta_text(&mut self, delta: String) {
+        self.pending_delta_text.push_str(&delta);
+    }
+
+    fn push_summary_line(&mut self, line: String) {
+        if self.summary_lines.last() == Some(&line) {
             return;
         }
-        self.activity_lines.push(line);
-        let keep_from = self.activity_lines.len().saturating_sub(8);
+        self.summary_lines.push(line);
+        let keep_from = self.summary_lines.len().saturating_sub(8);
         if keep_from > 0 {
-            self.activity_lines.drain(..keep_from);
+            self.summary_lines.drain(..keep_from);
         }
     }
 
-    fn render_progress(&self) -> String {
+    fn render_progress_body(&self) -> String {
+        let _ = (
+            self.explored_files,
+            self.explored_searches,
+            self.edited_files,
+            self.command_runs,
+        );
         let mut parts = Vec::new();
-        let text = truncate(&self.agent_text(), self.max_chars);
+        let text = truncate(&self.process_text(), self.max_chars);
         if !text.trim().is_empty() {
             parts.push(format!("Codex：{text}"));
         }
-        if !self.activity_lines.is_empty() {
-            parts.push(self.activity_lines.join("\n"));
+        if !self.summary_lines.is_empty() {
+            parts.push(self.summary_lines.join("\n"));
         }
         parts.join("\n\n")
     }
@@ -238,25 +257,42 @@ impl StreamPreviewState {
             .find(|(existing_id, _)| existing_id == &item_id)
         {
             *existing = text;
-            self.rebuild_full_text_from_messages();
+            self.pending_delta_text.clear();
             return;
         }
         self.agent_messages.push((item_id, text));
-        self.rebuild_full_text_from_messages();
+        self.pending_delta_text.clear();
     }
 
-    fn rebuild_full_text_from_messages(&mut self) {
-        self.full_text = self
+    fn process_text(&self) -> String {
+        let mut sections = self
             .agent_messages
             .iter()
             .map(|(_, text)| text.trim())
             .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let pending = self.pending_delta_text.trim();
+        if !pending.is_empty() {
+            if sections.is_empty() {
+                sections.push(pending.to_string());
+            } else if let Some(last) = sections.last_mut() {
+                last.push_str(pending);
+            }
+        }
+        sections.join("\n\n")
     }
 
-    fn agent_text(&self) -> String {
-        self.full_text.clone()
+    fn record_tool_completion(&mut self, label: &str) {
+        if label == "Shell" {
+            self.command_runs += 1;
+        }
+        if label.contains("搜索") {
+            self.explored_searches += 1;
+        }
+        if label.contains("修改文件") {
+            self.edited_files += 1;
+        }
     }
 }
 
