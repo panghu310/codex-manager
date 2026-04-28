@@ -2064,6 +2064,73 @@ mod tests {
     }
 
     #[test]
+    fn stream_preview_renders_processing_header_text_and_summary_sections() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+
+        let rendered = preview
+            .push_progress(
+                app_server::TurnProgress::Message {
+                    item_id: "message-1".to_string(),
+                    text: "我先查看和消息展示有关的入口。".to_string(),
+                },
+                0,
+            )
+            .expect("should render");
+
+        assert_eq!(rendered, "正在处理...\n\n我先查看和消息展示有关的入口。");
+    }
+
+    #[test]
+    fn stream_preview_summarizes_exploration_and_command_counts() {
+        let mut preview = StreamPreviewState::new(1500, 4, 320);
+
+        assert_eq!(
+            preview.push_progress(
+                app_server::TurnProgress::ToolCompleted {
+                    item_id: "tool-1".to_string(),
+                    label: "Shell".to_string(),
+                    success: Some(true),
+                    summary: None,
+                },
+                0,
+            ),
+            Some("正在处理...\n\nran 1 commands".to_string())
+        );
+
+        assert_eq!(
+            preview.push_progress(
+                app_server::TurnProgress::ToolCompleted {
+                    item_id: "tool-2".to_string(),
+                    label: "Web 搜索".to_string(),
+                    success: Some(true),
+                    summary: None,
+                },
+                100,
+            ),
+            Some("正在处理...\n\n已探索 1 次搜索\nran 1 commands".to_string())
+        );
+    }
+
+    #[test]
+    fn stream_preview_summarizes_file_change_as_edit() {
+        let mut preview = StreamPreviewState::new(1500, 4, 320);
+
+        let rendered = preview
+            .push_progress(
+                app_server::TurnProgress::ToolCompleted {
+                    item_id: "tool-1".to_string(),
+                    label: "修改文件".to_string(),
+                    success: Some(true),
+                    summary: None,
+                },
+                0,
+            )
+            .expect("should render");
+
+        assert_eq!(rendered, "正在处理...\n\n已编辑 1 个文件");
+    }
+
+    #[test]
     fn stream_preview_appends_tool_progress_to_agent_text() {
         let mut preview = StreamPreviewState::new(1500, 4, 200);
 
@@ -2158,6 +2225,30 @@ mod tests {
                     ]
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn stream_preview_keeps_processing_header_when_waiting_for_approval() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+
+        let rendered = preview
+            .push_progress(
+                app_server::TurnProgress::ApprovalRequested {
+                    request_id: 42,
+                    label: "Shell".to_string(),
+                },
+                0,
+            )
+            .expect("should render");
+
+        assert_eq!(rendered, "正在处理...\n\n等待审批 Shell");
+        assert_eq!(
+            progress_reply_markup(&app_server::TurnProgress::ApprovalRequested {
+                request_id: 42,
+                label: "Shell".to_string(),
+            }),
+            Some(approval_keyboard(42))
         );
     }
 
