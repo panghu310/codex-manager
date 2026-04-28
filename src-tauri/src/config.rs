@@ -12,7 +12,13 @@ pub struct CodexProvider {
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
+    pub auth_text: Option<String>,
+    #[serde(default)]
     pub config_text: Option<String>,
+    #[serde(default)]
+    pub context_window_1m: bool,
+    #[serde(default)]
+    pub auto_compact_token_limit: Option<u64>,
     #[serde(default)]
     pub active: bool,
     #[serde(default)]
@@ -56,8 +62,8 @@ pub fn write_config_at(path: &Path, config: &AppConfig) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建配置目录失败：{err}"))?;
     }
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|err| format!("编码配置失败：{err}"))?;
+    let text =
+        serde_json::to_string_pretty(config).map_err(|err| format!("编码配置失败：{err}"))?;
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, text).map_err(|err| format!("写入临时文件失败：{err}"))?;
     fs::rename(&tmp, path).map_err(|err| format!("替换配置文件失败：{err}"))

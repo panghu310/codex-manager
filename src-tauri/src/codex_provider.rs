@@ -1,6 +1,6 @@
 use crate::config::{read_config_at, write_config_at, CodexProvider};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +13,12 @@ pub struct CodexProviderView {
     pub model: String,
     pub api_key_masked: String,
     pub has_api_key: bool,
+    pub auth_text: String,
+    pub rendered_auth_text: String,
     pub config_text: String,
     pub rendered_config_text: String,
+    pub context_window_1m: bool,
+    pub auto_compact_token_limit: Option<u64>,
     pub active: bool,
     pub is_official: bool,
 }
@@ -51,7 +55,6 @@ pub fn save_provider(
     store_path: &Path,
     mut provider: CodexProvider,
 ) -> Result<CodexProviderView, String> {
-    validate_provider(&provider)?;
     provider.id = normalize_id(&provider.id, &provider.name);
 
     let mut store = read_store(store_path)?;
@@ -63,9 +66,20 @@ pub fn save_provider(
         if provider.api_key.as_deref().unwrap_or("").trim().is_empty() {
             provider.api_key = existing.api_key.clone();
         }
+        if provider
+            .auth_text
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            provider.auth_text = existing.auth_text.clone();
+        }
         provider.active = existing.active;
+        validate_provider(&provider)?;
         *existing = provider.clone();
     } else {
+        validate_provider(&provider)?;
         store.providers.push(provider.clone());
     }
 
@@ -136,11 +150,48 @@ pub fn render_provider_config(provider: &CodexProvider) -> String {
     }
 
     let key = provider_key(&provider.name);
-    format!(
-        "model_provider = \"{key}\"\nmodel = \"{}\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.{key}]\nname = \"{key}\"\nbase_url = \"{}\"\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+    let mut text = format!(
+        "model_provider = \"{key}\"\nmodel = \"{}\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n",
         escape_toml_string(&provider.model),
+    );
+    if provider.context_window_1m {
+        text.push_str("model_context_window = 1000000\n");
+        text.push_str(&format!(
+            "model_auto_compact_token_limit = {}\n",
+            provider.auto_compact_token_limit.unwrap_or(900_000)
+        ));
+    }
+    text.push_str(&format!(
+        "\n[model_providers.{key}]\nname = \"{key}\"\nbase_url = \"{}\"\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
         escape_toml_string(&provider.base_url),
-    )
+    ));
+    text
+}
+
+pub fn render_provider_auth_text(provider: &CodexProvider) -> String {
+    if provider.is_official {
+        return "{}\n".to_string();
+    }
+
+    if let Some(text) = provider
+        .auth_text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        return text.to_string();
+    }
+
+    let auth = match provider
+        .api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(api_key) => json!({ "OPENAI_API_KEY": api_key }),
+        None => json!({}),
+    };
+    let mut text = serde_json::to_string_pretty(&auth).unwrap_or_else(|_| "{}".to_string());
+    text.push('\n');
+    text
 }
 
 pub fn mask_secret(value: &str) -> String {
@@ -188,17 +239,15 @@ fn write_codex_live_config(codex_dir: &Path, provider: &CodexProvider) -> Result
             .map_err(|err| format!("Codex config.toml 语法错误：{err}"))?;
     }
 
-    let auth = match provider
-        .api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        Some(api_key) => json!({ "OPENAI_API_KEY": api_key }),
-        None => json!({}),
-    };
-    let auth_text = serde_json::to_vec_pretty(&auth)
+    let auth_text = render_provider_auth_text(provider);
+    let auth: Value = serde_json::from_str(&auth_text)
+        .map_err(|err| format!("Codex auth.json 语法错误：{err}"))?;
+    if !auth.is_object() {
+        return Err("Codex auth.json 必须是 JSON 对象".to_string());
+    }
+    let auth_bytes = serde_json::to_vec_pretty(&auth)
         .map_err(|err| format!("编码 Codex auth.json 失败：{err}"))?;
-    atomic_write(&codex_dir.join("auth.json"), &auth_text)?;
+    atomic_write(&codex_dir.join("auth.json"), &auth_bytes)?;
     atomic_write(&codex_dir.join("config.toml"), config_text.as_bytes())
 }
 
@@ -211,8 +260,12 @@ fn to_view(provider: &CodexProvider, active_id: Option<&str>) -> CodexProviderVi
         model: provider.model.clone(),
         api_key_masked: mask_secret(api_key),
         has_api_key: !api_key.trim().is_empty(),
+        auth_text: provider.auth_text.clone().unwrap_or_default(),
+        rendered_auth_text: render_provider_auth_text(provider),
         config_text: provider.config_text.clone().unwrap_or_default(),
         rendered_config_text: render_provider_config(provider),
+        context_window_1m: provider.context_window_1m,
+        auto_compact_token_limit: provider.auto_compact_token_limit,
         active: active_id == Some(provider.id.as_str()),
         is_official: provider.is_official,
     }
@@ -221,6 +274,9 @@ fn to_view(provider: &CodexProvider, active_id: Option<&str>) -> CodexProviderVi
 fn validate_provider(provider: &CodexProvider) -> Result<(), String> {
     if provider.name.trim().is_empty() {
         return Err("供应商名称不能为空".to_string());
+    }
+    if provider.is_official {
+        return Ok(());
     }
     if provider.base_url.trim().is_empty() {
         return Err("Base URL 不能为空".to_string());
@@ -235,6 +291,20 @@ fn validate_provider(provider: &CodexProvider) -> Result<(), String> {
     {
         toml::from_str::<toml::Table>(text)
             .map_err(|err| format!("Codex config.toml 语法错误：{err}"))?;
+    }
+    let auth_text = render_provider_auth_text(provider);
+    let auth: Value = serde_json::from_str(&auth_text)
+        .map_err(|err| format!("Codex auth.json 语法错误：{err}"))?;
+    if !auth.is_object() {
+        return Err("Codex auth.json 必须是 JSON 对象".to_string());
+    }
+    let api_key = auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if api_key.is_empty() {
+        return Err("自定义供应商必须填写 OPENAI_API_KEY".to_string());
     }
     Ok(())
 }
@@ -290,7 +360,10 @@ mod tests {
             base_url: "https://example.com/v1".to_string(),
             model: "gpt-5.4".to_string(),
             api_key: Some("sk-demo".to_string()),
+            auth_text: None,
             config_text: None,
+            context_window_1m: false,
+            auto_compact_token_limit: None,
             active: false,
             is_official: false,
         };
@@ -303,6 +376,71 @@ mod tests {
     }
 
     #[test]
+    fn render_provider_config_adds_context_window_fields() {
+        let provider = CodexProvider {
+            id: "demo".to_string(),
+            name: "Demo API".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            model: "gpt-5.4".to_string(),
+            api_key: Some("sk-demo".to_string()),
+            auth_text: None,
+            config_text: None,
+            context_window_1m: true,
+            auto_compact_token_limit: Some(850_000),
+            active: false,
+            is_official: false,
+        };
+
+        let text = render_provider_config(&provider);
+
+        assert!(text.contains("model_context_window = 1000000"));
+        assert!(text.contains("model_auto_compact_token_limit = 850000"));
+        toml::from_str::<toml::Table>(&text).expect("有效 TOML");
+    }
+
+    #[test]
+    fn render_provider_auth_uses_auth_json_when_present() {
+        let provider = CodexProvider {
+            id: "demo".to_string(),
+            name: "Demo API".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            model: "gpt-5.4".to_string(),
+            api_key: Some("sk-field".to_string()),
+            auth_text: Some("{\"OPENAI_API_KEY\":\"sk-auth\"}".to_string()),
+            config_text: None,
+            context_window_1m: false,
+            auto_compact_token_limit: None,
+            active: false,
+            is_official: false,
+        };
+
+        let text = render_provider_auth_text(&provider);
+        let auth: serde_json::Value = serde_json::from_str(&text).expect("有效 JSON");
+
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-auth");
+    }
+
+    #[test]
+    fn official_provider_writes_empty_auth_and_config() {
+        let provider = CodexProvider {
+            id: "openai".to_string(),
+            name: "OpenAI 官方".to_string(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            auth_text: Some("{\"OPENAI_API_KEY\":\"sk-ignored\"}".to_string()),
+            config_text: Some("model = \"ignored\"".to_string()),
+            context_window_1m: true,
+            auto_compact_token_limit: Some(900_000),
+            active: false,
+            is_official: true,
+        };
+
+        assert_eq!(render_provider_auth_text(&provider), "{}\n");
+        assert_eq!(render_provider_config(&provider), "");
+    }
+
+    #[test]
     fn save_provider_preserves_existing_key_when_new_key_is_empty() {
         let dir = temp_dir("provider-preserve");
         let store_path = dir.join("providers.json");
@@ -312,7 +450,10 @@ mod tests {
             base_url: "https://one.example/v1".to_string(),
             model: "gpt-5.4".to_string(),
             api_key: Some("sk-old".to_string()),
+            auth_text: None,
             config_text: None,
+            context_window_1m: false,
+            auto_compact_token_limit: None,
             active: false,
             is_official: false,
         };
@@ -326,7 +467,10 @@ mod tests {
                 base_url: "https://two.example/v1".to_string(),
                 model: "gpt-5.4".to_string(),
                 api_key: Some(String::new()),
+                auth_text: None,
                 config_text: None,
+                context_window_1m: false,
+                auto_compact_token_limit: None,
                 active: false,
                 is_official: false,
             },
@@ -349,7 +493,10 @@ mod tests {
             base_url: "https://example.com/v1".to_string(),
             model: "gpt-5.4".to_string(),
             api_key: Some("sk-demo".to_string()),
+            auth_text: None,
             config_text: None,
+            context_window_1m: true,
+            auto_compact_token_limit: Some(900_000),
             active: false,
             is_official: false,
         };
@@ -361,9 +508,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(codex_dir.join("auth.json")).unwrap())
                 .unwrap();
         assert_eq!(auth["OPENAI_API_KEY"], "sk-demo");
-        assert!(fs::read_to_string(codex_dir.join("config.toml"))
-            .unwrap()
-            .contains("wire_api = \"responses\""));
+        let config_text = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(config_text.contains("wire_api = \"responses\""));
+        assert!(config_text.contains("model_context_window = 1000000"));
+        assert!(config_text.contains("model_auto_compact_token_limit = 900000"));
         let _ = fs::remove_dir_all(dir);
     }
 

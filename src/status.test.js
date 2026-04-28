@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildCodexAuthText,
+  buildCodexConfigText,
   codexProviderPresets,
   fetchAppServerThread,
   fetchAppServerThreads,
@@ -17,6 +19,9 @@ import {
   summarizeAppServerStatus,
   summarizeAppServerThread,
   summarizeAppServerThreads,
+  syncCodexConfigBaseUrl,
+  syncCodexConfigContextWindow,
+  syncCodexConfigModel,
   summarizeThreadTurns
 } from "./status.js";
 import {
@@ -338,8 +343,52 @@ test("providerRowActions 允许删除未使用的供应商", () => {
 test("codexProviderPresets 提供基础 Codex 供应商模板", () => {
   const presets = codexProviderPresets();
 
-  assert.ok(presets.some((preset) => preset.id === "openai"));
-  assert.ok(presets.every((preset) => preset.name && preset.baseUrl && preset.model));
+  assert.deepEqual(presets.map((preset) => preset.id), ["openai", "custom"]);
+  assert.equal(presets[0].isOfficial, true);
+  assert.equal(presets[1].isOfficial, false);
+  assert.ok(presets.every((preset) => preset.name));
+});
+
+test("buildCodexAuthText 生成 Codex auth.json 文本", () => {
+  assert.equal(buildCodexAuthText("sk-demo"), "{\n  \"OPENAI_API_KEY\": \"sk-demo\"\n}");
+  assert.equal(buildCodexAuthText(""), "{}");
+});
+
+test("buildCodexConfigText 生成自定义 Responses 配置", () => {
+  const text = buildCodexConfigText({
+    baseUrl: "https://example.com/v1",
+    model: "gpt-5.4",
+    contextWindow1m: true,
+    autoCompactTokenLimit: 850000
+  });
+
+  assert.match(text, /model_provider = "custom"/);
+  assert.match(text, /model = "gpt-5.4"/);
+  assert.match(text, /model_context_window = 1000000/);
+  assert.match(text, /model_auto_compact_token_limit = 850000/);
+  assert.match(text, /\[model_providers\.custom\]/);
+  assert.ok(text.includes('base_url = "https://example.com/v1"'));
+});
+
+test("Codex config 同步工具更新模型、地址和上下文窗口字段", () => {
+  let text = buildCodexConfigText({
+    baseUrl: "https://one.example/v1",
+    model: "gpt-5.4"
+  });
+
+  text = syncCodexConfigBaseUrl(text, "https://two.example/v1");
+  text = syncCodexConfigModel(text, "gpt-5.5");
+  text = syncCodexConfigContextWindow(text, true, 900000);
+
+  assert.match(text, /model = "gpt-5.5"/);
+  assert.ok(text.includes('base_url = "https://two.example/v1"'));
+  assert.match(text, /model_context_window = 1000000/);
+  assert.match(text, /model_auto_compact_token_limit = 900000/);
+
+  text = syncCodexConfigContextWindow(text, false, 900000);
+
+  assert.doesNotMatch(text, /model_context_window/);
+  assert.doesNotMatch(text, /model_auto_compact_token_limit/);
 });
 
 test("groupSessionsByProject 按项目目录组织 Codex 会话", () => {

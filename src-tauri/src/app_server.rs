@@ -1,7 +1,7 @@
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +12,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcRequest {
@@ -61,6 +62,36 @@ pub struct AppServerTurnHandle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnProgress {
+    Delta(String),
+    Message {
+        item_id: String,
+        text: String,
+    },
+    ToolStarted {
+        item_id: String,
+        label: String,
+    },
+    ToolCompleted {
+        item_id: String,
+        label: String,
+        success: Option<bool>,
+        summary: Option<String>,
+    },
+    ApprovalRequested {
+        request_id: u64,
+        label: String,
+    },
+    ApprovalResolved {
+        request_id: u64,
+    },
+    ClientRequestHandled {
+        request_id: u64,
+        label: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadStatusChange {
     pub thread_id: String,
     pub status: String,
@@ -87,8 +118,15 @@ pub struct RateLimitSummary {
 pub struct PersistentAppServerClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    approval_requests: Arc<Mutex<HashMap<u64, PendingApprovalRequest>>>,
     events: broadcast::Sender<Value>,
     child: Arc<Mutex<Child>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingApprovalRequest {
+    method: String,
+    permissions: Option<Value>,
 }
 
 pub fn request(method: impl Into<String>, params: Option<Value>) -> RpcRequest {
@@ -150,17 +188,19 @@ pub fn thread_read_request(thread_id: &str, include_turns: bool) -> RpcRequest {
 }
 
 pub fn thread_start_request(cwd: Option<&str>) -> RpcRequest {
-    let params = cwd
-        .filter(|value| !value.trim().is_empty())
-        .map(|cwd| json!({ "cwd": cwd }))
-        .unwrap_or_else(|| json!({}));
+    let mut params = full_access_thread_params();
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        params["cwd"] = json!(cwd);
+    }
     request("thread/start", Some(params))
 }
 
 pub fn turn_start_request(thread_id: &str, prompt: &str, cwd: Option<&str>) -> RpcRequest {
     let mut params = json!({
         "threadId": thread_id,
-        "input": [{ "type": "text", "text": prompt }]
+        "input": [{ "type": "text", "text": prompt }],
+        "approvalPolicy": "never",
+        "sandboxPolicy": { "type": "dangerFullAccess" }
     });
     if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
         params["cwd"] = json!(cwd);
@@ -217,12 +257,9 @@ pub fn thread_turns_list_request(
 }
 
 pub fn thread_resume_request(thread_id: &str) -> RpcRequest {
-    request(
-        "thread/resume",
-        Some(json!({
-            "threadId": thread_id
-        })),
-    )
+    let mut params = full_access_thread_params();
+    params["threadId"] = json!(thread_id);
+    request("thread/resume", Some(params))
 }
 
 pub fn thread_archive_request(thread_id: &str) -> RpcRequest {
@@ -236,6 +273,13 @@ pub fn thread_archive_request(thread_id: &str) -> RpcRequest {
 
 pub fn account_rate_limits_request() -> RpcRequest {
     request("account/rateLimits/read", Some(json!({})))
+}
+
+fn full_access_thread_params() -> Value {
+    json!({
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access",
+    })
 }
 
 pub fn standalone_cwd() -> Result<PathBuf, String> {
@@ -493,7 +537,7 @@ pub async fn run_turn_interruptible_persistent_with_progress(
     started: oneshot::Sender<AppServerTurnHandle>,
     interrupt: oneshot::Receiver<oneshot::Sender<Result<(), String>>>,
     resume_existing_thread: bool,
-    progress: Option<mpsc::UnboundedSender<String>>,
+    progress: Option<mpsc::UnboundedSender<TurnProgress>>,
 ) -> Result<AppServerTurnResult, String> {
     if prompt.trim().is_empty() {
         return Err("prompt is required".to_string());
@@ -569,9 +613,9 @@ async fn read_persistent_turn_output_or_interrupt(
     thread_id: &str,
     turn_id: &str,
     interrupt: oneshot::Receiver<oneshot::Sender<Result<(), String>>>,
-    progress: Option<mpsc::UnboundedSender<String>>,
+    progress: Option<mpsc::UnboundedSender<TurnProgress>>,
 ) -> Result<TurnOutput, String> {
-    let deadline = tokio::time::sleep(Duration::from_secs(120));
+    let deadline = tokio::time::sleep(TURN_STATUS_POLL_INTERVAL);
     tokio::pin!(deadline);
     tokio::pin!(interrupt);
     let mut output = String::new();
@@ -584,12 +628,10 @@ async fn read_persistent_turn_output_or_interrupt(
                         if !event_matches_turn(&value, thread_id, turn_id) {
                             continue;
                         }
-                        if let Some(delta) = agent_delta(&value) {
-                            output.push_str(delta);
-                            if let Some(progress) = &progress {
-                                let _ = progress.send(delta.to_string());
-                            }
-                        }
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + TURN_STATUS_POLL_INTERVAL);
+                        apply_agent_event_to_output(&value, &mut output, progress.as_ref());
                         if value.get("method").and_then(Value::as_str) == Some("turn/completed") {
                             return Ok(TurnOutput { output, completed: true });
                         }
@@ -607,7 +649,28 @@ async fn read_persistent_turn_output_or_interrupt(
                 return Ok(TurnOutput { output, completed: false });
             }
             _ = &mut deadline => {
-                return Err("等待 Codex turn 完成超时".to_string());
+                match read_thread_live_status(&client, thread_id).await {
+                    Ok(status) if thread_status_is_active(Some(&status)) => {
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + TURN_STATUS_POLL_INTERVAL);
+                        if let Some(progress) = &progress {
+                            let _ = progress.send(TurnProgress::ToolStarted {
+                                item_id: format!("{turn_id}:status"),
+                                label: format!("当前会话仍在运行（{status}）"),
+                            });
+                        }
+                    }
+                    Ok(status) if status == "systemError" => {
+                        return Err("当前会话进入 systemError 状态".to_string());
+                    }
+                    Ok(_) => {
+                        return Ok(TurnOutput { output, completed: true });
+                    }
+                    Err(err) => {
+                        return Err(format!("当前会话长时间无事件，且状态查询失败：{err}"));
+                    }
+                }
             }
         }
     }
@@ -659,14 +722,25 @@ impl PersistentAppServerClient {
             .take()
             .ok_or_else(|| "无法打开 app-server stdout".to_string())?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let approval_requests = Arc::new(Mutex::new(HashMap::new()));
+        let auto_server_requests = Arc::new(Mutex::new(HashSet::new()));
         let (events, _) = broadcast::channel(256);
+        let stdin = Arc::new(Mutex::new(stdin));
         let client = Self {
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin: stdin.clone(),
             pending: pending.clone(),
+            approval_requests: approval_requests.clone(),
             events: events.clone(),
             child: Arc::new(Mutex::new(child)),
         };
-        tokio::spawn(read_persistent_app_server(stdout, pending, events));
+        tokio::spawn(read_persistent_app_server(
+            stdout,
+            stdin,
+            pending,
+            approval_requests,
+            auto_server_requests,
+            events,
+        ));
         client.initialize().await?;
         Ok(client)
     }
@@ -707,6 +781,20 @@ impl PersistentAppServerClient {
         self.write_json(value).await
     }
 
+    pub async fn respond_approval(&self, request_id: u64, decision: &str) -> Result<(), String> {
+        let approval = self
+            .approval_requests
+            .lock()
+            .await
+            .get(&request_id)
+            .cloned();
+        let approval =
+            approval.ok_or_else(|| "审批请求已结束或未找到，请重新查看当前状态。".to_string())?;
+        let result = approval_response_result(&approval, decision);
+        self.write_json(server_request_response(request_id, result))
+            .await
+    }
+
     pub async fn steer_turn(
         &self,
         thread_id: &str,
@@ -733,22 +821,25 @@ impl PersistentAppServerClient {
     }
 
     async fn write_json(&self, value: Value) -> Result<(), String> {
-        let line =
-            serde_json::to_string(&value).map_err(|err| format!("编码 JSON-RPC 失败：{err}"))?;
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|err| format!("写入 app-server 请求失败：{err}"))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|err| format!("写入 app-server 请求失败：{err}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|err| format!("刷新 app-server stdin 失败：{err}"))
+        write_json_to_stdin(&self.stdin, value).await
     }
+}
+
+async fn write_json_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, value: Value) -> Result<(), String> {
+    let line = serde_json::to_string(&value).map_err(|err| format!("编码 JSON-RPC 失败：{err}"))?;
+    let mut stdin = stdin.lock().await;
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|err| format!("写入 app-server 请求失败：{err}"))?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|err| format!("写入 app-server 请求失败：{err}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|err| format!("刷新 app-server stdin 失败：{err}"))
 }
 
 impl Drop for PersistentAppServerClient {
@@ -761,7 +852,10 @@ impl Drop for PersistentAppServerClient {
 
 async fn read_persistent_app_server(
     stdout: ChildStdout,
+    stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    approval_requests: Arc<Mutex<HashMap<u64, PendingApprovalRequest>>>,
+    auto_server_requests: Arc<Mutex<HashSet<u64>>>,
     events: broadcast::Sender<Value>,
 ) {
     let mut reader = BufReader::new(stdout).lines();
@@ -777,7 +871,7 @@ async fn read_persistent_app_server(
                 return;
             }
         };
-        let value: Value = match serde_json::from_str(&line) {
+        let mut value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(err) => {
                 let _ = events.send(json!({
@@ -787,6 +881,29 @@ async fn read_persistent_app_server(
                 continue;
             }
         };
+        if let (Some(id), Some(method)) = (
+            value.get("id").and_then(Value::as_u64),
+            value.get("method").and_then(Value::as_str),
+        ) {
+            note_approval_request(&approval_requests, id, method, &value).await;
+            if let Some(response) = automatic_server_request_response(id, method) {
+                auto_server_requests.lock().await.insert(id);
+                if let Err(err) = write_json_to_stdin(&stdin, response).await {
+                    let _ = events.send(json!({
+                        "method": "app-server/write-error",
+                        "params": { "error": err }
+                    }));
+                }
+            }
+            let _ = events.send(value);
+            continue;
+        }
+        if let Some(request_id) = resolved_request_id(&value) {
+            if auto_server_requests.lock().await.remove(&request_id) {
+                mark_auto_server_request_resolved(&mut value);
+            }
+            approval_requests.lock().await.remove(&request_id);
+        }
         if let Some(id) = value.get("id").and_then(Value::as_u64) {
             let result = if let Some(error) = value.get("error") {
                 Err(format!("app-server 返回错误：{error}"))
@@ -813,6 +930,28 @@ async fn fail_pending(
     for (_, tx) in pending.drain() {
         let _ = tx.send(Err(message.to_string()));
     }
+}
+
+async fn note_approval_request(
+    approval_requests: &Arc<Mutex<HashMap<u64, PendingApprovalRequest>>>,
+    id: u64,
+    method: &str,
+    value: &Value,
+) {
+    if !is_approval_request_method(method) {
+        return;
+    }
+    let permissions = value
+        .get("params")
+        .and_then(|params| params.get("permissions"))
+        .cloned();
+    approval_requests.lock().await.insert(
+        id,
+        PendingApprovalRequest {
+            method: method.to_string(),
+            permissions,
+        },
+    );
 }
 
 async fn call_once(codex_path: &str, requests: Vec<RpcRequest>) -> Result<Value, String> {
@@ -930,7 +1069,7 @@ impl AppServerConnection {
     }
 
     async fn read_turn_output(&mut self) -> Result<String, String> {
-        let deadline = tokio::time::sleep(Duration::from_secs(120));
+        let deadline = tokio::time::sleep(TURN_STATUS_POLL_INTERVAL);
         tokio::pin!(deadline);
         let mut output = String::new();
 
@@ -943,15 +1082,16 @@ impl AppServerConnection {
                     };
                     let value: Value = serde_json::from_str(&line)
                         .map_err(|err| format!("解析 app-server 通知失败：{err}; line={line}"))?;
-                    if let Some(delta) = agent_delta(&value) {
-                        output.push_str(delta);
-                    }
+                    deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + TURN_STATUS_POLL_INTERVAL);
+                    apply_agent_event_to_output(&value, &mut output, None);
                     if value.get("method").and_then(Value::as_str) == Some("turn/completed") {
                         return Ok(output);
                     }
                 }
                 _ = &mut deadline => {
-                    return Err("等待 Codex turn 完成超时".to_string());
+                    return Err("等待 Codex turn 通知空闲超时".to_string());
                 }
             }
         }
@@ -963,7 +1103,7 @@ impl AppServerConnection {
         turn_id: &str,
         interrupt: oneshot::Receiver<oneshot::Sender<Result<(), String>>>,
     ) -> Result<TurnOutput, String> {
-        let deadline = tokio::time::sleep(Duration::from_secs(120));
+        let deadline = tokio::time::sleep(TURN_STATUS_POLL_INTERVAL);
         tokio::pin!(deadline);
         tokio::pin!(interrupt);
         let mut output = String::new();
@@ -977,9 +1117,10 @@ impl AppServerConnection {
                     };
                     let value: Value = serde_json::from_str(&line)
                         .map_err(|err| format!("解析 app-server 通知失败：{err}; line={line}"))?;
-                    if let Some(delta) = agent_delta(&value) {
-                        output.push_str(delta);
-                    }
+                    deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + TURN_STATUS_POLL_INTERVAL);
+                    apply_agent_event_to_output(&value, &mut output, None);
                     if value.get("method").and_then(Value::as_str) == Some("turn/completed") {
                         return Ok(TurnOutput { output, completed: true });
                     }
@@ -993,7 +1134,7 @@ impl AppServerConnection {
                     return Ok(TurnOutput { output, completed: false });
                 }
                 _ = &mut deadline => {
-                    return Err("等待 Codex turn 完成超时".to_string());
+                    return Err("等待 Codex turn 通知空闲超时".to_string());
                 }
             }
         }
@@ -1221,6 +1362,333 @@ fn agent_delta(value: &Value) -> Option<&str> {
         .get("params")
         .and_then(|params| params.get("delta").or_else(|| params.get("text")))
         .and_then(Value::as_str)
+}
+
+fn agent_completed_message(value: &Value) -> Option<&str> {
+    if value.get("method").and_then(Value::as_str) != Some("item/completed") {
+        return None;
+    }
+    let item = value.get("params")?.get("item")?;
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    if item_type != "agentMessage" && item_type != "agent_message" {
+        return None;
+    }
+    item.get("text")
+        .or_else(|| item.get("message"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn apply_agent_event_to_output(
+    value: &Value,
+    output: &mut String,
+    progress: Option<&mpsc::UnboundedSender<TurnProgress>>,
+) {
+    if let (Some(progress), Some(request_progress)) = (progress, server_request_progress(value)) {
+        let _ = progress.send(request_progress);
+    }
+    if let (Some(progress), Some(resolved)) = (progress, resolved_request_progress(value)) {
+        let _ = progress.send(resolved);
+    }
+    if value.get("method").and_then(Value::as_str) == Some("item/started") {
+        if let (Some(progress), Some(item)) = (progress, event_item(value)) {
+            if let Some(tool) = tool_started_progress(item) {
+                let _ = progress.send(tool);
+            }
+        }
+    }
+    if let Some(delta) = agent_delta(value) {
+        output.push_str(delta);
+        if let Some(progress) = progress {
+            let _ = progress.send(TurnProgress::Delta(delta.to_string()));
+        }
+    }
+    if let Some(message) = agent_completed_message(value) {
+        append_agent_message(output, message);
+        if let Some(progress) = progress {
+            let _ = progress.send(TurnProgress::Message {
+                item_id: event_item(value)
+                    .map(item_id)
+                    .unwrap_or_else(|| "message".to_string()),
+                text: message.to_string(),
+            });
+        }
+    }
+    if value.get("method").and_then(Value::as_str) == Some("item/completed") {
+        if let (Some(progress), Some(item)) = (progress, event_item(value)) {
+            if let Some(tool) = tool_completed_progress(item) {
+                let _ = progress.send(tool);
+            }
+        }
+    }
+}
+
+fn append_agent_message(output: &mut String, message: &str) {
+    let message = message.trim();
+    if message.is_empty() || output.trim_end().ends_with(message) {
+        return;
+    }
+    if output.trim().is_empty() || message.starts_with(output.trim()) {
+        *output = message.to_string();
+        return;
+    }
+    output.push_str("\n\n");
+    output.push_str(message);
+}
+
+fn event_item(value: &Value) -> Option<&Value> {
+    value.get("params")?.get("item")
+}
+
+fn item_id(item: &Value) -> String {
+    item.get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("item")
+        .to_string()
+}
+
+fn item_type(item: &Value) -> Option<&str> {
+    item.get("type").and_then(Value::as_str)
+}
+
+fn tool_started_progress(item: &Value) -> Option<TurnProgress> {
+    let label = tool_label(item)?;
+    Some(TurnProgress::ToolStarted {
+        item_id: item_id(item),
+        label,
+    })
+}
+
+fn tool_completed_progress(item: &Value) -> Option<TurnProgress> {
+    let item_type = item_type(item)?;
+    if item_type == "agentMessage" || item_type == "agent_message" {
+        return None;
+    }
+    let label = tool_label(item)?;
+    let status = value_string(item, &["status"]);
+    let success = status.as_deref().map(|status| {
+        matches!(
+            status,
+            "completed" | "in_progress" | "inProgress" | "succeeded" | "success"
+        )
+    });
+    Some(TurnProgress::ToolCompleted {
+        item_id: item_id(item),
+        label,
+        success,
+        summary: None,
+    })
+}
+
+fn tool_label(item: &Value) -> Option<String> {
+    match item_type(item)? {
+        "commandExecution" | "command_execution" => Some("Shell".to_string()),
+        "mcpToolCall" | "mcp_tool_call" => {
+            let server = value_string(item, &["server"]).unwrap_or_else(|| "MCP".to_string());
+            let tool = value_string(item, &["tool"]).unwrap_or_else(|| "tool".to_string());
+            Some(format!("{server}：{tool}"))
+        }
+        "dynamicToolCall" | "dynamic_tool_call" => {
+            let namespace = value_string(item, &["namespace"]);
+            let tool = value_string(item, &["tool"]).unwrap_or_else(|| "tool".to_string());
+            Some(match namespace.filter(|value| !value.trim().is_empty()) {
+                Some(namespace) => format!("{namespace}：{tool}"),
+                None => tool,
+            })
+        }
+        "webSearch" | "web_search" => Some("Web 搜索".to_string()),
+        "fileChange" | "file_change" => Some("修改文件".to_string()),
+        "imageView" | "image_view" => Some("查看图片".to_string()),
+        "imageGeneration" | "image_generation" => Some("生成图片".to_string()),
+        "collabAgentToolCall" | "collab_agent_tool_call" => {
+            value_string(item, &["tool"]).map(|tool| format!("子代理：{tool}"))
+        }
+        "contextCompaction" | "context_compaction" => Some("压缩上下文".to_string()),
+        _ => None,
+    }
+}
+
+async fn read_thread_live_status(
+    client: &PersistentAppServerClient,
+    thread_id: &str,
+) -> Result<String, String> {
+    let result = client
+        .request(thread_read_request(thread_id, false))
+        .await?;
+    thread_read_status(&result).ok_or_else(|| format!("thread/read 响应缺少 status：{result}"))
+}
+
+fn thread_read_status(result: &Value) -> Option<String> {
+    let thread = result.get("thread").unwrap_or(result);
+    thread.get("status").and_then(status_value_to_string)
+}
+
+fn thread_status_is_active(status: Option<&str>) -> bool {
+    status
+        .map(|status| {
+            let status = status.trim();
+            status == "running"
+                || status == "in_progress"
+                || status == "inProgress"
+                || status == "active"
+                || status.starts_with("active:")
+                || status == "queued"
+        })
+        .unwrap_or(false)
+}
+
+fn server_request_progress(value: &Value) -> Option<TurnProgress> {
+    let method = value.get("method").and_then(Value::as_str)?;
+    let request_id = value.get("id").and_then(Value::as_u64)?;
+    let label = match method {
+        "item/commandExecution/requestApproval" => "Shell",
+        "item/fileChange/requestApproval" => "修改文件",
+        "item/permissions/requestApproval" => "权限申请",
+        "item/tool/requestUserInput" => {
+            return Some(TurnProgress::ClientRequestHandled {
+                request_id,
+                label: "用户输入请求已自动跳过".to_string(),
+            });
+        }
+        "mcpServer/elicitation/request" => {
+            return Some(TurnProgress::ClientRequestHandled {
+                request_id,
+                label: "MCP 输入请求已自动取消".to_string(),
+            });
+        }
+        "item/tool/call" => {
+            return Some(TurnProgress::ClientRequestHandled {
+                request_id,
+                label: "动态工具请求已返回不支持".to_string(),
+            });
+        }
+        "account/chatgptAuthTokens/refresh" => {
+            return Some(TurnProgress::ClientRequestHandled {
+                request_id,
+                label: "登录刷新请求已返回错误".to_string(),
+            });
+        }
+        "applyPatchApproval" | "execCommandApproval" => {
+            return Some(TurnProgress::ClientRequestHandled {
+                request_id,
+                label: "旧版审批请求已自动拒绝".to_string(),
+            });
+        }
+        _ => return None,
+    };
+    Some(TurnProgress::ApprovalRequested {
+        request_id,
+        label: label.to_string(),
+    })
+}
+
+fn is_approval_request_method(method: &str) -> bool {
+    method == "item/commandExecution/requestApproval"
+        || method == "item/fileChange/requestApproval"
+        || method == "item/permissions/requestApproval"
+}
+
+fn resolved_request_id(value: &Value) -> Option<u64> {
+    if value.get("method").and_then(Value::as_str) != Some("serverRequest/resolved") {
+        return None;
+    }
+    value
+        .get("params")?
+        .get("requestId")
+        .or_else(|| value.get("params")?.get("request_id"))
+        .and_then(Value::as_u64)
+}
+
+fn resolved_request_progress(value: &Value) -> Option<TurnProgress> {
+    if auto_server_request_resolved(value) {
+        return None;
+    }
+    resolved_request_id(value).map(|request_id| TurnProgress::ApprovalResolved { request_id })
+}
+
+fn auto_server_request_resolved(value: &Value) -> bool {
+    value
+        .get("params")
+        .and_then(|params| params.get("_codexManagerAutoHandled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn mark_auto_server_request_resolved(value: &mut Value) {
+    if let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("_codexManagerAutoHandled".to_string(), json!(true));
+    }
+}
+
+fn server_request_response(id: u64, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn server_request_error_response(id: u64, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
+fn automatic_server_request_response(id: u64, method: &str) -> Option<Value> {
+    let result = match method {
+        "item/tool/requestUserInput" => json!({ "answers": {} }),
+        "mcpServer/elicitation/request" => json!({
+            "action": "cancel",
+            "content": null,
+            "_meta": null
+        }),
+        "item/tool/call" => json!({
+            "contentItems": [{
+                "type": "inputText",
+                "text": "当前 Telegram 客户端不支持该动态工具。"
+            }],
+            "success": false
+        }),
+        "applyPatchApproval" | "execCommandApproval" => json!({ "decision": "denied" }),
+        "account/chatgptAuthTokens/refresh" => {
+            return Some(server_request_error_response(
+                id,
+                -32001,
+                "当前 Telegram 客户端无法刷新 ChatGPT 登录，请在本机重新登录 Codex。",
+            ));
+        }
+        _ => return None,
+    };
+    Some(server_request_response(id, result))
+}
+
+fn approval_decision_value(decision: &str) -> Value {
+    match decision {
+        "session" => json!("acceptForSession"),
+        "decline" => json!("decline"),
+        "cancel" => json!("cancel"),
+        _ => json!("accept"),
+    }
+}
+
+fn approval_response_result(approval: &PendingApprovalRequest, decision: &str) -> Value {
+    if approval.method == "item/permissions/requestApproval" {
+        let permissions = match decision {
+            "decline" | "cancel" => json!({}),
+            _ => approval.permissions.clone().unwrap_or_else(|| json!({})),
+        };
+        return json!({
+            "permissions": permissions,
+            "scope": if decision == "session" { "session" } else { "turn" },
+        });
+    }
+    json!({ "decision": approval_decision_value(decision) })
 }
 
 fn event_matches_turn(value: &Value, thread_id: &str, turn_id: &str) -> bool {
@@ -1696,7 +2164,10 @@ mod tests {
         let rpc = thread_resume_request("thread-1");
 
         assert_eq!(rpc.method, "thread/resume");
-        assert_eq!(rpc.params.unwrap()["threadId"], "thread-1");
+        let params = rpc.params.unwrap();
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "danger-full-access");
     }
 
     #[test]
@@ -1753,11 +2224,31 @@ mod tests {
     }
 
     #[test]
-    fn thread_start_request_without_cwd_still_sends_empty_params() {
+    fn thread_start_request_without_cwd_uses_full_access_permissions() {
         let rpc = thread_start_request(None);
 
         assert_eq!(rpc.method, "thread/start");
-        assert_eq!(rpc.params, Some(json!({})));
+        assert_eq!(
+            rpc.params,
+            Some(json!({
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }))
+        );
+    }
+
+    #[test]
+    fn turn_start_request_uses_full_access_permissions() {
+        let rpc = turn_start_request("thread-1", "继续", None);
+
+        assert_eq!(rpc.method, "turn/start");
+        let params = rpc.params.unwrap();
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(
+            params["sandboxPolicy"],
+            json!({ "type": "dangerFullAccess" })
+        );
     }
 
     #[test]
@@ -1790,6 +2281,446 @@ mod tests {
         });
 
         assert_eq!(agent_delta(&value), Some("hello"));
+    }
+
+    #[test]
+    fn agent_completed_message_reads_item_completed_text() {
+        let value = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "text": "最终回复"
+                }
+            }
+        });
+
+        assert_eq!(agent_completed_message(&value), Some("最终回复"));
+    }
+
+    #[test]
+    fn apply_agent_event_sends_completed_message_to_progress() {
+        let value = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "message-1",
+                    "type": "agentMessage",
+                    "text": "中间回复"
+                }
+            }
+        });
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+
+        apply_agent_event_to_output(&value, &mut output, Some(&progress_tx));
+
+        assert_eq!(output, "中间回复");
+        assert_eq!(
+            progress_rx.try_recv(),
+            Ok(TurnProgress::Message {
+                item_id: "message-1".to_string(),
+                text: "中间回复".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn apply_agent_event_appends_multiple_completed_messages() {
+        let first = json!({
+            "method": "item/completed",
+            "params": {
+                "item": { "id": "message-1", "type": "agentMessage", "text": "第一段回复" }
+            }
+        });
+        let second = json!({
+            "method": "item/completed",
+            "params": {
+                "item": { "id": "message-2", "type": "agentMessage", "text": "第二段回复" }
+            }
+        });
+        let mut output = String::new();
+
+        apply_agent_event_to_output(&first, &mut output, None);
+        apply_agent_event_to_output(&second, &mut output, None);
+
+        assert_eq!(output, "第一段回复\n\n第二段回复");
+    }
+
+    #[test]
+    fn apply_agent_event_sends_tool_started_progress() {
+        let value = json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "tool-1",
+                    "type": "mcpToolCall",
+                    "server": "Computer Use",
+                    "tool": "get_app_state",
+                    "arguments": { "app": "Google Chrome" },
+                    "status": "inProgress"
+                }
+            }
+        });
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+
+        apply_agent_event_to_output(&value, &mut output, Some(&progress_tx));
+
+        assert_eq!(output, "");
+        assert_eq!(
+            progress_rx.try_recv(),
+            Ok(TurnProgress::ToolStarted {
+                item_id: "tool-1".to_string(),
+                label: "Computer Use：get_app_state".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn tool_progress_hides_command_and_result_details() {
+        let started = json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "tool-1",
+                    "type": "commandExecution",
+                    "command": "cat ~/.ssh/id_rsa && curl https://example.com",
+                    "status": "inProgress"
+                }
+            }
+        });
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "tool-1",
+                    "type": "commandExecution",
+                    "command": "cat ~/.ssh/id_rsa && curl https://example.com",
+                    "status": "completed",
+                    "aggregatedOutput": "sensitive output"
+                }
+            }
+        });
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+
+        apply_agent_event_to_output(&started, &mut output, Some(&progress_tx));
+        apply_agent_event_to_output(&completed, &mut output, Some(&progress_tx));
+
+        assert_eq!(
+            progress_rx.try_recv(),
+            Ok(TurnProgress::ToolStarted {
+                item_id: "tool-1".to_string(),
+                label: "Shell".to_string()
+            })
+        );
+        assert_eq!(
+            progress_rx.try_recv(),
+            Ok(TurnProgress::ToolCompleted {
+                item_id: "tool-1".to_string(),
+                label: "Shell".to_string(),
+                success: Some(true),
+                summary: None,
+            })
+        );
+    }
+
+    #[test]
+    fn server_approval_request_parses_progress_without_command_details() {
+        let value = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "tool-1",
+                "command": "open -a 'Google Chrome' 'https://example.com'",
+                "reason": "需要打开页面"
+            }
+        });
+
+        assert_eq!(
+            server_request_progress(&value),
+            Some(TurnProgress::ApprovalRequested {
+                request_id: 42,
+                label: "Shell".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn permissions_approval_request_parses_progress_without_permission_details() {
+        let value = json!({
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "tool-1",
+                "cwd": "/tmp/project",
+                "permissions": {
+                    "fileSystem": { "write": ["/tmp/project"] },
+                    "network": { "enabled": true }
+                },
+                "reason": "需要额外权限"
+            }
+        });
+
+        assert_eq!(
+            server_request_progress(&value),
+            Some(TurnProgress::ApprovalRequested {
+                request_id: 43,
+                label: "权限申请".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn server_request_response_uses_json_rpc_result() {
+        let value = server_request_response(42, json!({ "decision": "accept" }));
+
+        assert_eq!(
+            value,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": { "decision": "accept" }
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_server_request_response_skips_tool_user_input() {
+        let value = automatic_server_request_response(50, "item/tool/requestUserInput")
+            .expect("request_user_input should be answered");
+
+        assert_eq!(
+            value,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 50,
+                "result": { "answers": {} }
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_server_request_response_cancels_mcp_elicitation() {
+        let value = automatic_server_request_response(51, "mcpServer/elicitation/request")
+            .expect("MCP elicitation should be answered");
+
+        assert_eq!(
+            value,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 51,
+                "result": {
+                    "action": "cancel",
+                    "content": null,
+                    "_meta": null
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_server_request_response_rejects_dynamic_tool_call() {
+        let value = automatic_server_request_response(52, "item/tool/call")
+            .expect("dynamic tool call should be answered");
+
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 52);
+        assert_eq!(value["result"]["success"], false);
+        assert_eq!(value["result"]["contentItems"][0]["type"], "inputText");
+    }
+
+    #[test]
+    fn automatic_server_request_response_fails_auth_refresh_immediately() {
+        let value = automatic_server_request_response(53, "account/chatgptAuthTokens/refresh")
+            .expect("auth refresh should receive an immediate error");
+
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 53);
+        assert!(value.get("error").is_some());
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("无法刷新 ChatGPT 登录"));
+    }
+
+    #[test]
+    fn automatic_server_request_response_leaves_modern_approvals_pending() {
+        assert_eq!(
+            automatic_server_request_response(54, "item/commandExecution/requestApproval"),
+            None
+        );
+        assert_eq!(
+            automatic_server_request_response(55, "item/fileChange/requestApproval"),
+            None
+        );
+        assert_eq!(
+            automatic_server_request_response(56, "item/permissions/requestApproval"),
+            None
+        );
+    }
+
+    #[test]
+    fn server_request_progress_reports_non_approval_fallbacks() {
+        let user_input = json!({
+            "jsonrpc": "2.0",
+            "id": 60,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "tool-1",
+                "questions": []
+            }
+        });
+        let mcp = json!({
+            "jsonrpc": "2.0",
+            "id": 61,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "serverName": "demo",
+                "mode": "url",
+                "message": "需要授权",
+                "url": "https://example.com",
+                "elicitationId": "e1",
+                "_meta": null
+            }
+        });
+
+        assert_eq!(
+            server_request_progress(&user_input),
+            Some(TurnProgress::ClientRequestHandled {
+                request_id: 60,
+                label: "用户输入请求已自动跳过".to_string(),
+            })
+        );
+        assert_eq!(
+            server_request_progress(&mcp),
+            Some(TurnProgress::ClientRequestHandled {
+                request_id: 61,
+                label: "MCP 输入请求已自动取消".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn approval_response_result_uses_decision_for_command_and_file_requests() {
+        let approval = PendingApprovalRequest {
+            method: "item/commandExecution/requestApproval".to_string(),
+            permissions: None,
+        };
+
+        assert_eq!(
+            approval_response_result(&approval, "accept"),
+            json!({ "decision": "accept" })
+        );
+        assert_eq!(
+            approval_response_result(&approval, "session"),
+            json!({ "decision": "acceptForSession" })
+        );
+        assert_eq!(
+            approval_response_result(&approval, "decline"),
+            json!({ "decision": "decline" })
+        );
+    }
+
+    #[test]
+    fn approval_response_result_grants_requested_permissions_subset() {
+        let permissions = json!({
+            "fileSystem": { "write": ["/tmp/project"] },
+            "network": { "enabled": true }
+        });
+        let approval = PendingApprovalRequest {
+            method: "item/permissions/requestApproval".to_string(),
+            permissions: Some(permissions.clone()),
+        };
+
+        assert_eq!(
+            approval_response_result(&approval, "session"),
+            json!({
+                "permissions": permissions,
+                "scope": "session",
+            })
+        );
+        assert_eq!(
+            approval_response_result(&approval, "decline"),
+            json!({
+                "permissions": {},
+                "scope": "turn",
+            })
+        );
+    }
+
+    #[test]
+    fn server_request_resolved_emits_progress_to_clear_approval() {
+        let value = json!({
+            "method": "serverRequest/resolved",
+            "params": {
+                "threadId": "thread-1",
+                "requestId": 42
+            }
+        });
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+
+        apply_agent_event_to_output(&value, &mut output, Some(&progress_tx));
+
+        assert_eq!(output, "");
+        assert_eq!(
+            progress_rx.try_recv(),
+            Ok(TurnProgress::ApprovalResolved { request_id: 42 })
+        );
+    }
+
+    #[test]
+    fn auto_handled_server_request_resolved_does_not_emit_approval_progress() {
+        let mut value = json!({
+            "method": "serverRequest/resolved",
+            "params": {
+                "threadId": "thread-1",
+                "requestId": 42
+            }
+        });
+        mark_auto_server_request_resolved(&mut value);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+
+        apply_agent_event_to_output(&value, &mut output, Some(&progress_tx));
+
+        assert_eq!(output, "");
+        assert!(progress_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn thread_read_status_detects_active_structured_status() {
+        let value = json!({
+            "thread": {
+                "id": "thread-1",
+                "status": { "type": "active", "activeFlags": ["waitingOnApproval"] }
+            }
+        });
+
+        assert_eq!(
+            thread_read_status(&value).as_deref(),
+            Some("active:waitingOnApproval")
+        );
+        assert!(thread_status_is_active(Some("active:waitingOnApproval")));
+        assert!(!thread_status_is_active(Some("idle")));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod app_server;
 mod bot_settings;
 mod codex_provider;
 mod config;
+mod startup_permissions;
 
 use serde::Serialize;
 use tauri::image::Image;
@@ -128,7 +129,16 @@ fn activate_provider_from_tray(app: &AppHandle, id: &str) {
         },
         id,
     ) {
-        Ok(_) => refresh_tray_menu(app),
+        Ok(_) => {
+            if let Some(state) = app.try_state::<bot_settings::BotManager>() {
+                if bot_settings::service_status(&state).running {
+                    if let Err(err) = bot_settings::restart_bot(&state) {
+                        eprintln!("切换供应商后重启 Telegram Bot 失败：{err}");
+                    }
+                }
+            }
+            refresh_tray_menu(app)
+        }
         Err(err) => eprintln!("切换 Codex 供应商失败：{err}"),
     }
 }
@@ -192,6 +202,7 @@ fn delete_codex_provider(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 fn activate_codex_provider(
     app: AppHandle,
+    state: tauri::State<bot_settings::BotManager>,
     id: String,
 ) -> Result<codex_provider::CodexProviderView, String> {
     let activated = codex_provider::activate_provider(
@@ -199,6 +210,9 @@ fn activate_codex_provider(
         &codex_provider::default_codex_dir()?,
         &id,
     )?;
+    if bot_settings::service_status(&state).running {
+        bot_settings::restart_bot(&state)?;
+    }
     refresh_tray_menu(&app);
     Ok(activated)
 }
@@ -281,6 +295,14 @@ pub fn run() {
             move_window_to
         ])
         .setup(|app| {
+            let prompts = startup_permissions::request_startup_permissions();
+            if prompts.screen_capture_requested {
+                eprintln!("已请求 macOS 屏幕录制权限");
+            }
+            if prompts.accessibility_prompted {
+                eprintln!("已请求 macOS 辅助功能权限");
+            }
+
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.app_handle().clone();
                 window.on_window_event(move |event| {

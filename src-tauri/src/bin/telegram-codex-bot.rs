@@ -66,6 +66,7 @@ struct SentMessage {
 }
 
 const TELEGRAM_TEXT_CHUNK_LIMIT: usize = 3500;
+const EMPTY_TURN_RETRY_PROMPT: &str = "继续";
 
 struct Bot {
     config: Config,
@@ -123,7 +124,10 @@ struct StreamPreviewState {
     min_delta_chars: usize,
     max_chars: usize,
     full_text: String,
+    agent_messages: Vec<(String, String)>,
+    activity_lines: Vec<String>,
     last_sent_text: String,
+    last_sent_agent_chars: usize,
     last_sent_at_ms: Option<u64>,
 }
 
@@ -134,30 +138,125 @@ impl StreamPreviewState {
             min_delta_chars,
             max_chars,
             full_text: String::new(),
+            agent_messages: Vec::new(),
+            activity_lines: Vec::new(),
             last_sent_text: String::new(),
+            last_sent_agent_chars: 0,
             last_sent_at_ms: None,
         }
     }
 
-    fn push(&mut self, delta: &str, now_ms: u64) -> Option<String> {
-        self.full_text.push_str(delta);
-        let display_text = truncate(&self.full_text, self.max_chars);
-        let delta_chars = display_text
+    fn push_progress(&mut self, progress: app_server::TurnProgress, now_ms: u64) -> Option<String> {
+        let force = match progress {
+            app_server::TurnProgress::Delta(delta) => {
+                self.full_text.push_str(&delta);
+                false
+            }
+            app_server::TurnProgress::Message { item_id, text } => {
+                self.upsert_agent_message(item_id, text);
+                true
+            }
+            app_server::TurnProgress::ToolStarted { label, .. } => {
+                self.push_activity(format!("正在调用 {label}"));
+                true
+            }
+            app_server::TurnProgress::ToolCompleted {
+                label,
+                success,
+                summary: _,
+                ..
+            } => {
+                let suffix = match success {
+                    Some(true) => "已调用完成",
+                    Some(false) => "调用失败",
+                    None => "调用结束",
+                };
+                self.push_activity(format!("{label} {suffix}"));
+                true
+            }
+            app_server::TurnProgress::ApprovalRequested { label, .. } => {
+                self.push_activity(format!("等待审批 {label}"));
+                true
+            }
+            app_server::TurnProgress::ApprovalResolved { .. } => {
+                self.push_activity("审批已处理".to_string());
+                true
+            }
+            app_server::TurnProgress::ClientRequestHandled { label, .. } => {
+                self.push_activity(label);
+                true
+            }
+        };
+        let display_text = self.render_progress();
+        let delta_chars = self
+            .full_text
             .chars()
             .count()
-            .saturating_sub(self.last_sent_text.chars().count());
+            .saturating_sub(self.last_sent_agent_chars);
         let interval_elapsed = self
             .last_sent_at_ms
             .is_some_and(|last| now_ms.saturating_sub(last) >= self.interval_ms);
-        if delta_chars < self.min_delta_chars && !interval_elapsed {
+        if !force && delta_chars < self.min_delta_chars && !interval_elapsed {
             return None;
         }
         if display_text == self.last_sent_text || display_text.trim().is_empty() {
             return None;
         }
         self.last_sent_text = display_text.clone();
+        self.last_sent_agent_chars = self.full_text.chars().count();
         self.last_sent_at_ms = Some(now_ms);
         Some(display_text)
+    }
+
+    fn push_activity(&mut self, line: String) {
+        if self.activity_lines.last() == Some(&line) {
+            return;
+        }
+        self.activity_lines.push(line);
+        let keep_from = self.activity_lines.len().saturating_sub(8);
+        if keep_from > 0 {
+            self.activity_lines.drain(..keep_from);
+        }
+    }
+
+    fn render_progress(&self) -> String {
+        let mut parts = Vec::new();
+        let text = truncate(&self.agent_text(), self.max_chars);
+        if !text.trim().is_empty() {
+            parts.push(format!("Codex：{text}"));
+        }
+        if !self.activity_lines.is_empty() {
+            parts.push(self.activity_lines.join("\n"));
+        }
+        parts.join("\n\n")
+    }
+
+    fn upsert_agent_message(&mut self, item_id: String, text: String) {
+        if let Some((_, existing)) = self
+            .agent_messages
+            .iter_mut()
+            .find(|(existing_id, _)| existing_id == &item_id)
+        {
+            *existing = text;
+            self.rebuild_full_text_from_messages();
+            return;
+        }
+        self.agent_messages.push((item_id, text));
+        self.rebuild_full_text_from_messages();
+    }
+
+    fn rebuild_full_text_from_messages(&mut self) {
+        self.full_text = self
+            .agent_messages
+            .iter()
+            .map(|(_, text)| text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    fn agent_text(&self) -> String {
+        self.full_text.clone()
     }
 }
 
@@ -399,14 +498,37 @@ impl Bot {
     }
 
     async fn handle_callback(&mut self, callback: CallbackQuery) -> Result<(), String> {
-        self.answer_callback(&callback.id).await?;
-        if !self.is_allowed(Some(callback.from.id)) {
+        let callback_id = callback.id;
+        let from_id = callback.from.id;
+        let message = callback.message;
+        let data = callback.data.unwrap_or_default();
+        if data.starts_with("approval:") {
+            if !self.is_allowed(Some(from_id)) {
+                self.answer_callback_text(&callback_id, "没有权限使用这个 bot。", true)
+                    .await?;
+                return Ok(());
+            }
+            let Some(message) = message else {
+                self.answer_callback_text(
+                    &callback_id,
+                    "审批消息已不可用，请重新查看当前状态。",
+                    true,
+                )
+                .await?;
+                return Ok(());
+            };
+            return self
+                .handle_approval_callback(&callback_id, message, &data)
+                .await;
+        }
+
+        self.answer_callback(&callback_id).await?;
+        if !self.is_allowed(Some(from_id)) {
             return Ok(());
         }
-        let Some(message) = callback.message else {
+        let Some(message) = message else {
             return Ok(());
         };
-        let data = callback.data.unwrap_or_default();
         match data.as_str() {
             "new" => self.start_new_thread(message.chat.id).await,
             "projects" => {
@@ -514,7 +636,9 @@ impl Bot {
         }
         let client = self.client.clone();
         let token = self.config.token.clone();
-        let processing_message = self.send_text(chat_id, "正在处理...").await?;
+        let processing_message = self
+            .send_message(chat_id, "正在处理...", Some(stop_generation_keyboard()))
+            .await?;
         let app_client = self.app_client.clone();
         let thread_id = self.current_thread_id.clone();
         let resume_existing_thread =
@@ -535,26 +659,62 @@ impl Bot {
                 progress_rx,
             );
             match app_server::run_turn_interruptible_persistent_with_progress(
-                app_client,
+                app_client.clone(),
                 thread_id.as_deref(),
                 cwd.as_deref(),
                 &prompt,
                 started_tx,
                 interrupt_rx,
                 resume_existing_thread,
-                Some(progress_tx),
+                Some(progress_tx.clone()),
             )
             .await
             {
                 Ok(result) => {
                     preview_task.abort();
                     if !result.completed {
+                        if let Err(err) = sender
+                            .edit_text(
+                                chat_id,
+                                processing_message.message_id,
+                                interrupted_turn_text(),
+                            )
+                            .await
+                        {
+                            eprintln!("更新 Telegram 停止状态失败：{err}");
+                        }
                         return;
                     }
                     let output = if result.output.trim().is_empty() {
-                        "Codex 已完成，但没有返回文本。".to_string()
+                        let (retry_started_tx, _retry_started_rx) = tokio::sync::oneshot::channel();
+                        let (_retry_interrupt_tx, retry_interrupt_rx) = oneshot::channel();
+                        match app_server::run_turn_interruptible_persistent_with_progress(
+                            app_client,
+                            Some(&result.thread_id),
+                            cwd.as_deref(),
+                            EMPTY_TURN_RETRY_PROMPT,
+                            retry_started_tx,
+                            retry_interrupt_rx,
+                            false,
+                            Some(progress_tx),
+                        )
+                        .await
+                        {
+                            Ok(retry) if retry.completed && !retry.output.trim().is_empty() => {
+                                retry.output
+                            }
+                            Ok(_) => "Codex 已完成，但没有返回文本。".to_string(),
+                            Err(err) => {
+                                format!("Codex 已完成，但没有返回文本；自动发送“继续”也失败：{err}")
+                            }
+                        }
                     } else {
                         result.output
+                    };
+                    let output = if output.trim().is_empty() {
+                        "Codex 已完成，但没有返回文本。".to_string()
+                    } else {
+                        output
                     };
                     if let Err(err) = sender
                         .replace_processing_with_output(
@@ -675,7 +835,7 @@ impl Bot {
         match tokio::time::timeout(Duration::from_secs(8), ack_rx).await {
             Ok(Ok(Ok(()))) => {
                 self.active_turn = None;
-                self.send_text_unit(chat_id, "已停止当前生成。").await
+                self.send_text_unit(chat_id, interrupted_turn_text()).await
             }
             Ok(Ok(Err(err))) => {
                 self.send_text_unit(chat_id, &format!("停止失败：{err}"))
@@ -690,6 +850,53 @@ impl Bot {
                     .await
             }
         }
+    }
+
+    async fn handle_approval_callback(
+        &self,
+        callback_query_id: &str,
+        message: Message,
+        data: &str,
+    ) -> Result<(), String> {
+        let Some((request_id, decision)) = parse_approval_callback_data(data) else {
+            self.answer_callback_text(callback_query_id, "审批按钮数据无效。", true)
+                .await?;
+            return Ok(());
+        };
+        if let Err(err) = self.app_client.respond_approval(request_id, decision).await {
+            self.answer_callback_text(
+                callback_query_id,
+                "审批请求已失效，请重新查看当前状态。",
+                true,
+            )
+            .await?;
+            let text = approval_callback_failure_text(message.text.as_deref(), &err);
+            if let Err(edit_err) = self
+                .edit_text_with_reply_markup(
+                    message.chat.id,
+                    message.message_id,
+                    &text,
+                    Some(empty_inline_keyboard()),
+                )
+                .await
+            {
+                eprintln!("更新失效审批消息失败：{edit_err}");
+                self.send_text_unit(message.chat.id, &format!("审批请求已失效：{err}"))
+                    .await?;
+            }
+            return Ok(());
+        }
+        let label = approval_decision_label(decision);
+        self.answer_callback_text(callback_query_id, &format!("已选择：{label}"), false)
+            .await?;
+        let text = message.text.unwrap_or_else(|| "等待审批".to_string());
+        self.edit_text_with_reply_markup(
+            message.chat.id,
+            message.message_id,
+            &format!("{text}\n\n已选择：{label}"),
+            Some(json!({ "inline_keyboard": [] })),
+        )
+        .await
     }
 
     async fn send_menu(&mut self, chat_id: i64) -> Result<(), String> {
@@ -1028,12 +1235,26 @@ impl Bot {
         message_id: i64,
         view: MenuView,
     ) -> Result<(), String> {
+        self.edit_text_with_reply_markup(chat_id, message_id, &view.text, Some(view.reply_markup))
+            .await
+    }
+
+    async fn edit_text_with_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<(), String> {
         let value = json!({
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": view.text,
-            "reply_markup": view.reply_markup
         });
+        let mut value = value;
+        value["text"] = json!(text);
+        if let Some(reply_markup) = reply_markup {
+            value["reply_markup"] = reply_markup;
+        }
         match self.telegram::<Value>("editMessageText", &value).await {
             Ok(_) => Ok(()),
             Err(err) if err.contains("message is not modified") => Ok(()),
@@ -1042,7 +1263,18 @@ impl Bot {
     }
 
     async fn answer_callback(&self, callback_query_id: &str) -> Result<(), String> {
-        let value = json!({ "callback_query_id": callback_query_id });
+        let value = answer_callback_payload(callback_query_id, None, false);
+        let _: TelegramResponse<Value> = self.telegram("answerCallbackQuery", &value).await?;
+        Ok(())
+    }
+
+    async fn answer_callback_text(
+        &self,
+        callback_query_id: &str,
+        text: &str,
+        show_alert: bool,
+    ) -> Result<(), String> {
+        let value = answer_callback_payload(callback_query_id, Some(text), show_alert);
         let _: TelegramResponse<Value> = self.telegram("answerCallbackQuery", &value).await?;
         Ok(())
     }
@@ -1087,18 +1319,37 @@ fn spawn_stream_preview(
     sender: TelegramSender,
     chat_id: i64,
     message_id: i64,
-    mut progress_rx: mpsc::UnboundedReceiver<String>,
+    mut progress_rx: mpsc::UnboundedReceiver<app_server::TurnProgress>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let started_at = Instant::now();
         let mut preview = StreamPreviewState::new(1500, 40, 1800);
-        while let Some(delta) = progress_rx.recv().await {
+        let mut pending_approval_id = None;
+        while let Some(progress) = progress_rx.recv().await {
+            match &progress {
+                app_server::TurnProgress::ApprovalRequested { request_id, .. } => {
+                    pending_approval_id = Some(*request_id);
+                }
+                app_server::TurnProgress::ApprovalResolved { request_id } => {
+                    if pending_approval_id == Some(*request_id) {
+                        pending_approval_id = None;
+                    }
+                }
+                _ => {}
+            }
+            let reply_markup = Some(active_turn_reply_markup(pending_approval_id));
             let now_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let Some(text) = preview.push(&delta, now_ms) else {
+            let text = preview.push_progress(progress, now_ms);
+            let Some(text) = text else {
                 continue;
             };
             if let Err(err) = sender
-                .edit_text(chat_id, message_id, &format!("正在处理...\n\n{text}"))
+                .edit_text_with_reply_markup(
+                    chat_id,
+                    message_id,
+                    &format!("正在处理...\n\n{text}"),
+                    reply_markup,
+                )
                 .await
             {
                 eprintln!("更新 Telegram 流式预览失败：{err}");
@@ -1106,6 +1357,95 @@ fn spawn_stream_preview(
             }
         }
     })
+}
+
+fn approval_keyboard(request_id: u64) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "允许本次", "callback_data": format!("approval:{request_id}:accept") },
+            { "text": "本会话允许", "callback_data": format!("approval:{request_id}:session") },
+            { "text": "拒绝", "callback_data": format!("approval:{request_id}:decline") }
+        ]]
+    })
+}
+
+fn stop_generation_keyboard() -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "停止本轮", "callback_data": "stop" }
+        ]]
+    })
+}
+
+fn active_turn_reply_markup(pending_approval_id: Option<u64>) -> Value {
+    pending_approval_id
+        .map(approval_keyboard)
+        .unwrap_or_else(stop_generation_keyboard)
+}
+
+fn empty_inline_keyboard() -> Value {
+    json!({ "inline_keyboard": [] })
+}
+
+fn progress_reply_markup(progress: &app_server::TurnProgress) -> Option<Value> {
+    match progress {
+        app_server::TurnProgress::ApprovalRequested { request_id, .. } => {
+            Some(approval_keyboard(*request_id))
+        }
+        app_server::TurnProgress::ApprovalResolved { .. }
+        | app_server::TurnProgress::ClientRequestHandled { .. } => Some(stop_generation_keyboard()),
+        _ => Some(stop_generation_keyboard()),
+    }
+}
+
+fn parse_approval_callback_data(data: &str) -> Option<(u64, &str)> {
+    let mut parts = data.split(':');
+    if parts.next()? != "approval" {
+        return None;
+    }
+    let request_id = parts.next()?.parse::<u64>().ok()?;
+    let decision = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match decision {
+        "accept" | "session" | "decline" => Some((request_id, decision)),
+        _ => None,
+    }
+}
+
+fn approval_decision_label(decision: &str) -> &'static str {
+    match decision {
+        "session" => "本会话允许",
+        "decline" => "已拒绝",
+        _ => "已允许本次",
+    }
+}
+
+fn approval_callback_failure_text(original: Option<&str>, err: &str) -> String {
+    let original = original
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("等待审批");
+    if original.contains("审批请求已失效：") {
+        return original.to_string();
+    }
+    format!("{original}\n\n审批请求已失效：{}", err.trim())
+}
+
+fn interrupted_turn_text() -> &'static str {
+    "已取消本轮生成。直接发送修改后的消息即可继续当前对话。"
+}
+
+fn answer_callback_payload(callback_query_id: &str, text: Option<&str>, show_alert: bool) -> Value {
+    let mut value = json!({ "callback_query_id": callback_query_id });
+    if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+        value["text"] = json!(text.chars().take(200).collect::<String>());
+        if show_alert {
+            value["show_alert"] = json!(true);
+        }
+    }
+    value
 }
 
 impl TelegramSender {
@@ -1150,11 +1490,26 @@ impl TelegramSender {
     }
 
     async fn edit_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<(), String> {
+        self.edit_text_with_reply_markup(chat_id, message_id, text, Some(empty_inline_keyboard()))
+            .await
+    }
+
+    async fn edit_text_with_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<(), String> {
         let value = json!({
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": text
+            "text": text,
         });
+        let mut value = value;
+        if let Some(reply_markup) = reply_markup {
+            value["reply_markup"] = reply_markup;
+        }
         match self.telegram::<Value>("editMessageText", &value).await {
             Ok(_) => Ok(()),
             Err(err) if err.contains("message is not modified") => Ok(()),
@@ -1602,6 +1957,11 @@ mod tests {
     }
 
     #[test]
+    fn empty_turn_retry_prompt_is_continue() {
+        assert_eq!(EMPTY_TURN_RETRY_PROMPT, "继续");
+    }
+
+    #[test]
     fn split_long_text_keeps_first_chunk_for_processing_message() {
         let chunks = split_long_text(&"a".repeat(TELEGRAM_TEXT_CHUNK_LIMIT + 2));
 
@@ -1614,16 +1974,300 @@ mod tests {
     fn stream_preview_flushes_only_after_min_delta_or_interval() {
         let mut preview = StreamPreviewState::new(1500, 8, 120);
 
-        assert_eq!(preview.push("短", 0), None);
-        assert_eq!(preview.push("消息", 200), None);
         assert_eq!(
-            preview.push("，这次足够长", 400).as_deref(),
-            Some("短消息，这次足够长")
+            preview.push_progress(app_server::TurnProgress::Delta("短".to_string()), 0),
+            None
         );
-        assert_eq!(preview.push("追加", 600), None);
         assert_eq!(
-            preview.push("内容", 2100).as_deref(),
-            Some("短消息，这次足够长追加内容")
+            preview.push_progress(app_server::TurnProgress::Delta("消息".to_string()), 200),
+            None
+        );
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Delta("，这次足够长".to_string()),
+                    400
+                )
+                .as_deref(),
+            Some("Codex：短消息，这次足够长")
+        );
+        assert_eq!(
+            preview.push_progress(app_server::TurnProgress::Delta("追加".to_string()), 600),
+            None
+        );
+        assert_eq!(
+            preview
+                .push_progress(app_server::TurnProgress::Delta("内容".to_string()), 2100)
+                .as_deref(),
+            Some("Codex：短消息，这次足够长追加内容")
+        );
+    }
+
+    #[test]
+    fn stream_preview_replaces_completed_message_instead_of_appending() {
+        let mut preview = StreamPreviewState::new(1500, 4, 120);
+
+        assert_eq!(
+            preview
+                .push_progress(app_server::TurnProgress::Delta("临时内容".to_string()), 0)
+                .as_deref(),
+            Some("Codex：临时内容")
+        );
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Message {
+                        item_id: "message-1".to_string(),
+                        text: "完整回复".to_string(),
+                    },
+                    100
+                )
+                .as_deref(),
+            Some("Codex：完整回复")
+        );
+        assert_eq!(
+            preview
+                .push_progress(app_server::TurnProgress::Delta("继续".to_string()), 2000)
+                .as_deref(),
+            Some("Codex：完整回复继续")
+        );
+    }
+
+    #[test]
+    fn stream_preview_keeps_multiple_completed_agent_messages() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Message {
+                        item_id: "message-1".to_string(),
+                        text: "我先看一下当前运行的浏览器窗口。".to_string(),
+                    },
+                    0
+                )
+                .as_deref(),
+            Some("Codex：我先看一下当前运行的浏览器窗口。")
+        );
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Message {
+                        item_id: "message-2".to_string(),
+                        text: "应用列表接口返回系统权限错误，我改用 Chrome 检查。".to_string(),
+                    },
+                    100
+                )
+                .as_deref(),
+            Some("Codex：我先看一下当前运行的浏览器窗口。\n\n应用列表接口返回系统权限错误，我改用 Chrome 检查。")
+        );
+    }
+
+    #[test]
+    fn stream_preview_appends_tool_progress_to_agent_text() {
+        let mut preview = StreamPreviewState::new(1500, 4, 200);
+
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Delta("先打开浏览器。".to_string()),
+                    0
+                )
+                .as_deref(),
+            Some("Codex：先打开浏览器。")
+        );
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::ToolStarted {
+                        item_id: "tool-1".to_string(),
+                        label: "Computer Use：get_app_state".to_string(),
+                    },
+                    100
+                )
+                .as_deref(),
+            Some("Codex：先打开浏览器。\n\n正在调用 Computer Use：get_app_state")
+        );
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::Delta("我继续检查。".to_string()),
+                    1800
+                )
+                .as_deref(),
+            Some("Codex：先打开浏览器。我继续检查。\n\n正在调用 Computer Use：get_app_state")
+        );
+    }
+
+    #[test]
+    fn stream_preview_hides_tool_arguments_and_results() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::ToolStarted {
+                        item_id: "tool-1".to_string(),
+                        label: "Shell".to_string(),
+                    },
+                    0
+                )
+                .as_deref(),
+            Some("正在调用 Shell")
+        );
+        assert_eq!(
+            preview
+                .push_progress(
+                    app_server::TurnProgress::ToolCompleted {
+                        item_id: "tool-1".to_string(),
+                        label: "Shell".to_string(),
+                        success: Some(true),
+                        summary: Some("sensitive output".to_string()),
+                    },
+                    100
+                )
+                .as_deref(),
+            Some("正在调用 Shell\nShell 已调用完成")
+        );
+    }
+
+    #[test]
+    fn stream_preview_shows_approval_request_without_command_details() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+        let progress = app_server::TurnProgress::ApprovalRequested {
+            request_id: 42,
+            label: "Shell".to_string(),
+        };
+
+        assert_eq!(
+            preview.push_progress(progress.clone(), 0).as_deref(),
+            Some("等待审批 Shell")
+        );
+        assert_eq!(
+            progress_reply_markup(&progress),
+            Some(approval_keyboard(42))
+        );
+        assert_eq!(
+            approval_keyboard(42),
+            json!({
+                "inline_keyboard": [
+                    [
+                        { "text": "允许本次", "callback_data": "approval:42:accept" },
+                        { "text": "本会话允许", "callback_data": "approval:42:session" },
+                        { "text": "拒绝", "callback_data": "approval:42:decline" }
+                    ]
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn stream_preview_shows_approval_resolved_and_clears_keyboard() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+        let progress = app_server::TurnProgress::ApprovalResolved { request_id: 42 };
+
+        assert_eq!(
+            preview.push_progress(progress.clone(), 0).as_deref(),
+            Some("审批已处理")
+        );
+        assert_eq!(
+            progress_reply_markup(&progress),
+            Some(stop_generation_keyboard())
+        );
+    }
+
+    #[test]
+    fn stream_preview_shows_auto_handled_client_request_without_keyboard() {
+        let mut preview = StreamPreviewState::new(1500, 4, 240);
+        let progress = app_server::TurnProgress::ClientRequestHandled {
+            request_id: 43,
+            label: "用户输入请求已自动跳过".to_string(),
+        };
+
+        assert_eq!(
+            preview.push_progress(progress.clone(), 0).as_deref(),
+            Some("用户输入请求已自动跳过")
+        );
+        assert_eq!(
+            progress_reply_markup(&progress),
+            Some(stop_generation_keyboard())
+        );
+    }
+
+    #[test]
+    fn active_generation_uses_stop_button_by_default() {
+        assert_eq!(
+            stop_generation_keyboard(),
+            json!({
+                "inline_keyboard": [[
+                    { "text": "停止本轮", "callback_data": "stop" }
+                ]]
+            })
+        );
+        assert_eq!(active_turn_reply_markup(None), stop_generation_keyboard());
+        assert_eq!(active_turn_reply_markup(Some(42)), approval_keyboard(42));
+    }
+
+    #[test]
+    fn interrupted_turn_text_invites_user_to_continue_same_session() {
+        assert_eq!(
+            interrupted_turn_text(),
+            "已取消本轮生成。直接发送修改后的消息即可继续当前对话。"
+        );
+    }
+
+    #[test]
+    fn approval_callback_data_accepts_known_decisions_only() {
+        assert_eq!(
+            parse_approval_callback_data("approval:42:accept"),
+            Some((42, "accept"))
+        );
+        assert_eq!(
+            parse_approval_callback_data("approval:42:session"),
+            Some((42, "session"))
+        );
+        assert_eq!(
+            parse_approval_callback_data("approval:42:decline"),
+            Some((42, "decline"))
+        );
+        assert_eq!(parse_approval_callback_data("approval:42:cancel"), None);
+        assert_eq!(parse_approval_callback_data("approval:abc:accept"), None);
+    }
+
+    #[test]
+    fn approval_callback_failure_text_is_visible_and_not_duplicated() {
+        let original = "正在处理...\n\n等待审批 Shell";
+        let text = approval_callback_failure_text(
+            Some(original),
+            "审批请求已结束或未找到，请重新查看当前状态。",
+        );
+
+        assert_eq!(
+            text,
+            "正在处理...\n\n等待审批 Shell\n\n审批请求已失效：审批请求已结束或未找到，请重新查看当前状态。"
+        );
+        assert_eq!(
+            approval_callback_failure_text(
+                Some(&text),
+                "审批请求已结束或未找到，请重新查看当前状态。"
+            ),
+            text
+        );
+    }
+
+    #[test]
+    fn answer_callback_payload_can_show_alert_text() {
+        assert_eq!(
+            answer_callback_payload("callback-1", Some("审批请求已失效"), true),
+            json!({
+                "callback_query_id": "callback-1",
+                "text": "审批请求已失效",
+                "show_alert": true
+            })
+        );
+        assert_eq!(
+            answer_callback_payload("callback-1", None, false),
+            json!({ "callback_query_id": "callback-1" })
         );
     }
 

@@ -699,6 +699,27 @@ code {
   gap: 14px;
 }
 
+.compact-options {
+  align-items: end;
+}
+
+.cc-form .checkbox-field {
+  min-height: 37px;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  align-self: end;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 11px;
+}
+
+.checkbox-field input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
 .field-row,
 .button-row,
 .status-line,

@@ -1,5 +1,7 @@
 import {
   activateCodexProvider,
+  buildCodexAuthText,
+  buildCodexConfigText,
   codexProviderPresets,
   deleteCodexProvider,
   deleteCodexSession,
@@ -16,7 +18,10 @@ import {
   restartTelegramBot,
   saveBotSettings,
   saveCodexProvider,
-  summarizeAppServerStatus
+  summarizeAppServerStatus,
+  syncCodexConfigBaseUrl,
+  syncCodexConfigContextWindow,
+  syncCodexConfigModel
 } from "./status.js";
 import { bindWindowDragging } from "./window-drag.js";
 import { check } from "@tauri-apps/plugin-updater";
@@ -236,30 +241,48 @@ function renderProviderCard(provider) {
 
 function renderProviderEdit() {
   const provider = selectedProviderForForm();
+  const draft = provider || codexProviderPresets().find((preset) => preset.id === "custom") || {};
+  const isOfficial = Boolean(draft.isOfficial);
+  const authText = draft.authText || draft.renderedAuthText || buildCodexAuthText(draft.apiKey || "");
+  const configText = draft.configText || draft.renderedConfigText || (
+    isOfficial
+      ? ""
+      : buildCodexConfigText({
+          baseUrl: draft.baseUrl,
+          model: draft.model,
+          contextWindow1m: draft.contextWindow1m,
+          autoCompactTokenLimit: draft.autoCompactTokenLimit || 900000
+        })
+  );
+  const compactLimit = draft.autoCompactTokenLimit || 900000;
   const presets = codexProviderPresets();
   return `
-    ${renderPageHeader(provider ? "编辑供应商" : "新增供应商", "配置 Codex 使用的模型、端点和凭据。", `<button type="button" class="secondary-button" data-action="home">← 返回</button>`)}
+    ${renderPageHeader(provider ? "编辑供应商" : "新增供应商", "配置 Codex 实际写入的 auth.json、config.toml 和模型参数。", `<button type="button" class="secondary-button" data-action="home">← 返回</button>`)}
     <section class="edit-card provider-edit-card">
-      <div class="large-avatar">${escapeHtml(initialLetter(provider?.name || "C"))}</div>
+      <div class="large-avatar">${escapeHtml(initialLetter(draft.name || "C"))}</div>
       <div class="preset-strip">
         ${presets.map((preset) => `<button type="button" data-action="use-provider-preset" data-id="${escapeAttr(preset.id)}">${escapeHtml(preset.name)}</button>`).join("")}
       </div>
       <form id="provider-form" class="cc-form">
         <input type="hidden" name="id" value="${escapeAttr(provider?.id || "")}">
-        <input type="hidden" name="isOfficial" value="${provider?.isOfficial ? 'true' : ''}">
+        <input type="hidden" name="isOfficial" value="${isOfficial ? 'true' : ''}">
         <div class="form-grid two">
-          <label>供应商名称<input name="name" value="${escapeAttr(provider?.name || "default")}" required></label>
-          <label>备注<input name="note" placeholder="例如：公司专用账号"></label>
+          <label>供应商名称<input name="name" value="${escapeAttr(draft.name || "自定义 Responses API")}" required></label>
+          <label>类型<input name="providerType" value="${escapeAttr(isOfficial ? "OpenAI 官方" : "自定义")}" readonly></label>
         </div>
-        <label>官网链接<input name="homepage" placeholder="https://example.com（可选）"></label>
-        <label>API Key<input name="apiKey" type="password" placeholder="${provider?.hasApiKey ? provider.apiKeyMasked : "OPENAI_API_KEY"}"></label>
+        <label>API Key<input name="apiKey" type="password" placeholder="${draft.hasApiKey ? draft.apiKeyMasked : (isOfficial ? "官方 OAuth 可留空" : "OPENAI_API_KEY")}"></label>
         <div class="field-row">
-          <label>API 请求地址<input name="baseUrl" value="${escapeAttr(provider?.baseUrl || "https://api.openai.com/v1")}" required></label>
+          <label>API 请求地址<input name="baseUrl" value="${escapeAttr(draft.baseUrl || "")}" placeholder="${isOfficial ? "官方 OAuth 不需要填写" : "https://example.com/v1"}" ${isOfficial ? "" : "required"}></label>
           <button type="button" class="link-button" data-action="read-config">管理与测试</button>
         </div>
-        <p class="hint">填写兼容 OpenAI Responses 格式的服务端点地址。</p>
-        <label>模型名称<input name="model" value="${escapeAttr(provider?.model || "gpt-5.5")}" required></label>
-        <label>自定义 config.toml<textarea name="configText" rows="7" placeholder="${escapeAttr(provider?.renderedConfigText || "留空时自动按 API 地址和模型生成")}">${escapeHtml(provider?.configText || "")}</textarea></label>
+        <p class="hint">${isOfficial ? "OpenAI 官方使用 Codex CLI 自带 OAuth，激活时写入空 auth.json 和空 config.toml。" : "自定义供应商按 OpenAI Responses 兼容格式写入 Codex 配置。"}</p>
+        <label>模型名称<input name="model" value="${escapeAttr(draft.model || "")}" placeholder="${isOfficial ? "官方默认模型可留空" : "gpt-5.4"}" ${isOfficial ? "" : "required"}></label>
+        <div class="form-grid two compact-options">
+          <label class="checkbox-field"><input name="contextWindow1m" type="checkbox" ${draft.contextWindow1m ? "checked" : ""} ${isOfficial ? "disabled" : ""}> 1M 上下文窗口</label>
+          <label>压缩阈值<input name="autoCompactTokenLimit" type="number" min="1" step="1" value="${escapeAttr(compactLimit)}" ${draft.contextWindow1m && !isOfficial ? "" : "disabled"}></label>
+        </div>
+        <label>auth.json<textarea name="authText" rows="5" ${isOfficial ? "readonly" : ""}>${escapeHtml(isOfficial ? "{}" : authText)}</textarea></label>
+        <label>config.toml<textarea name="configText" rows="10" ${isOfficial ? "readonly" : ""}>${escapeHtml(isOfficial ? "" : configText)}</textarea></label>
       </form>
     </section>
     <footer class="save-bar">
@@ -355,7 +378,10 @@ function bindEvents() {
   document.querySelectorAll("[data-action]").forEach((element) => {
     element.addEventListener("click", () => handleAction(element.dataset.action, element.dataset));
   });
-  document.querySelector("#provider-form")?.addEventListener("submit", handleProviderSubmit);
+  const providerForm = document.querySelector("#provider-form");
+  providerForm?.addEventListener("submit", handleProviderSubmit);
+  providerForm?.addEventListener("input", handleProviderConfigInput);
+  providerForm?.addEventListener("change", handleProviderConfigInput);
   document.querySelector("#bot-form")?.addEventListener("submit", handleBotSubmit);
   document.querySelector("#restart-bot")?.addEventListener("click", handleRestartBot);
   document.querySelector("#select-all-sessions")?.addEventListener("change", handleSelectAllSessions);
@@ -475,6 +501,7 @@ async function handleProviderSubmit(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   const id = form.get("id") || "";
+  const isOfficial = form.get("isOfficial") === "true";
   try {
     const saved = await saveCodexProvider({
       id,
@@ -482,8 +509,11 @@ async function handleProviderSubmit(event) {
       baseUrl: form.get("baseUrl") || "",
       model: form.get("model") || "",
       apiKey: form.get("apiKey") || "",
+      authText: isOfficial ? "{}" : (form.get("authText") || ""),
       configText: form.get("configText") || "",
-      isOfficial: form.get("isOfficial") === "true"
+      contextWindow1m: !isOfficial && form.get("contextWindow1m") === "on",
+      autoCompactTokenLimit: form.get("autoCompactTokenLimit") ? Number(form.get("autoCompactTokenLimit")) : null,
+      isOfficial
     });
     state.editingProviderId = saved?.id || id;
     state.message = "供应商已保存。";
@@ -493,6 +523,45 @@ async function handleProviderSubmit(event) {
     setError(error);
     render();
   }
+}
+
+function handleProviderConfigInput(event) {
+  const form = event.currentTarget;
+  const target = event.target;
+  if (!target?.name || form.elements.isOfficial.value === "true") return;
+
+  if (target.name === "apiKey") {
+    form.elements.authText.value = buildCodexAuthText(target.value);
+    return;
+  }
+  if (target.name === "baseUrl") {
+    form.elements.configText.value = syncCodexConfigBaseUrl(currentProviderConfigText(form), target.value);
+    return;
+  }
+  if (target.name === "model") {
+    form.elements.configText.value = syncCodexConfigModel(currentProviderConfigText(form), target.value);
+    return;
+  }
+  if (target.name === "contextWindow1m" || target.name === "autoCompactTokenLimit") {
+    const enabled = Boolean(form.elements.contextWindow1m.checked);
+    form.elements.autoCompactTokenLimit.disabled = !enabled;
+    form.elements.configText.value = syncCodexConfigContextWindow(
+      currentProviderConfigText(form),
+      enabled,
+      form.elements.autoCompactTokenLimit.value || 900000
+    );
+  }
+}
+
+function currentProviderConfigText(form) {
+  const current = form.elements.configText.value;
+  if (current.trim()) return current;
+  return buildCodexConfigText({
+    baseUrl: form.elements.baseUrl.value,
+    model: form.elements.model.value || "gpt-5.4",
+    contextWindow1m: Boolean(form.elements.contextWindow1m.checked),
+    autoCompactTokenLimit: form.elements.autoCompactTokenLimit.value || 900000
+  });
 }
 
 async function handleActivateProvider(id) {
@@ -534,13 +603,23 @@ function applyProviderPreset(id) {
   if (!preset) return;
   const form = document.querySelector("#provider-form");
   if (!form) return;
-  form.elements.id.value = preset.id;
+  form.elements.id.value = state.editingProviderId || (preset.isOfficial ? preset.id : "");
   form.elements.name.value = preset.name;
+  form.elements.providerType.value = preset.isOfficial ? "OpenAI 官方" : "自定义";
   form.elements.baseUrl.value = preset.baseUrl;
   form.elements.model.value = preset.model;
   form.elements.apiKey.value = "";
+  form.elements.authText.value = preset.isOfficial ? "{}" : (preset.authText || buildCodexAuthText(""));
   form.elements.configText.value = preset.configText || "";
   form.elements.isOfficial.value = preset.isOfficial ? 'true' : '';
+  form.elements.contextWindow1m.checked = Boolean(preset.contextWindow1m);
+  form.elements.contextWindow1m.disabled = Boolean(preset.isOfficial);
+  form.elements.autoCompactTokenLimit.value = preset.autoCompactTokenLimit || 900000;
+  form.elements.autoCompactTokenLimit.disabled = Boolean(preset.isOfficial || !preset.contextWindow1m);
+  form.elements.authText.readOnly = Boolean(preset.isOfficial);
+  form.elements.configText.readOnly = Boolean(preset.isOfficial);
+  form.elements.baseUrl.required = !preset.isOfficial;
+  form.elements.model.required = !preset.isOfficial;
 }
 
 async function loadSessions() {

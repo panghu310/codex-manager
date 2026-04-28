@@ -194,16 +194,74 @@ export function maskSecret(value) {
   return `${"*".repeat(Math.max(8, text.length - 4))}${text.slice(-4)}`;
 }
 
+export function buildCodexAuthText(apiKey = "") {
+  const key = String(apiKey || "").trim();
+  if (!key) return "{}";
+  return JSON.stringify({ OPENAI_API_KEY: key }, null, 2);
+}
+
+export function buildCodexConfigText({
+  baseUrl = "",
+  model = "gpt-5.4",
+  contextWindow1m = false,
+  autoCompactTokenLimit = 900000
+} = {}) {
+  const lines = [
+    'model_provider = "custom"',
+    `model = "${escapeTomlString(model)}"`,
+    'model_reasoning_effort = "high"',
+    "disable_response_storage = true"
+  ];
+  if (contextWindow1m) {
+    lines.push("model_context_window = 1000000");
+    lines.push(`model_auto_compact_token_limit = ${positiveInt(autoCompactTokenLimit, 900000)}`);
+  }
+  lines.push(
+    "",
+    "[model_providers.custom]",
+    'name = "custom"',
+    `base_url = "${escapeTomlString(baseUrl)}"`,
+    'env_key = "OPENAI_API_KEY"',
+    'wire_api = "responses"',
+    "requires_openai_auth = true"
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+export function syncCodexConfigBaseUrl(configText, baseUrl) {
+  const value = String(baseUrl || "").trim();
+  return setCodexTomlString(configText, "base_url", value, { providerScoped: true });
+}
+
+export function syncCodexConfigModel(configText, model) {
+  return setCodexTomlString(configText, "model", String(model || "").trim(), { providerScoped: false });
+}
+
+export function syncCodexConfigContextWindow(configText, enabled, autoCompactTokenLimit = 900000) {
+  let text = String(configText || "");
+  if (enabled) {
+    text = setCodexTopLevelInt(text, "model_context_window", 1000000);
+    text = setCodexTopLevelInt(text, "model_auto_compact_token_limit", positiveInt(autoCompactTokenLimit, 900000));
+    return text;
+  }
+  text = removeCodexTopLevelField(text, "model_context_window");
+  return removeCodexTopLevelField(text, "model_auto_compact_token_limit");
+}
+
 export function summarizeCodexProvider(provider) {
   return {
     id: provider?.id || "",
     name: provider?.name || "未命名供应商",
     baseUrl: provider?.baseUrl || provider?.base_url || "",
     model: provider?.model || "",
+    authText: provider?.authText || provider?.auth_text || "",
+    renderedAuthText: provider?.renderedAuthText || provider?.rendered_auth_text || provider?.authText || "",
     configText: provider?.configText || provider?.config_text || "",
     renderedConfigText: provider?.renderedConfigText || provider?.rendered_config_text || provider?.configText || "",
     apiKeyMasked: provider?.apiKeyMasked || provider?.api_key_masked || maskSecret(provider?.apiKey),
     hasApiKey: Boolean(provider?.hasApiKey ?? provider?.has_api_key ?? provider?.apiKey),
+    contextWindow1m: Boolean(provider?.contextWindow1m ?? provider?.context_window_1m),
+    autoCompactTokenLimit: provider?.autoCompactTokenLimit ?? provider?.auto_compact_token_limit ?? null,
     active: Boolean(provider?.active),
     isOfficial: Boolean(provider?.isOfficial ?? provider?.is_official)
   };
@@ -213,30 +271,136 @@ export function codexProviderPresets() {
   return [
     {
       id: "openai",
-      name: "OpenAI",
-      baseUrl: "https://api.openai.com/v1",
-      model: "gpt-5.4",
+      name: "OpenAI 官方",
+      baseUrl: "",
+      model: "",
       apiKey: "",
+      authText: "{}",
       configText: "",
       isOfficial: true
     },
     {
-      id: "custom_responses",
-      name: "Custom Responses API",
+      id: "custom",
+      name: "自定义 Responses API",
       baseUrl: "https://example.com/v1",
       model: "gpt-5.4",
       apiKey: "",
-      configText: ""
-    },
-    {
-      id: "local_proxy",
-      name: "Local Proxy",
-      baseUrl: "http://127.0.0.1:8080/v1",
-      model: "gpt-5.4",
-      apiKey: "",
-      configText: ""
+      authText: buildCodexAuthText(""),
+      configText: buildCodexConfigText({
+        baseUrl: "https://example.com/v1",
+        model: "gpt-5.4"
+      }),
+      isOfficial: false,
+      contextWindow1m: false,
+      autoCompactTokenLimit: null
     }
   ];
+}
+
+function escapeTomlString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function positiveInt(value, fallback) {
+  const number = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function setCodexTomlString(configText, fieldName, value, { providerScoped }) {
+  const lines = String(configText || "").split("\n");
+  if (lines.length === 1 && lines[0] === "") lines.pop();
+  const replacement = `${fieldName} = "${escapeTomlString(value)}"`;
+  const providerName = providerScoped ? codexModelProviderName(lines) : "";
+  const range = providerName ? tomlSectionRange(lines, `model_providers.${providerName}`) : null;
+
+  if (range) {
+    const existing = assignmentLineIndex(lines, fieldName, range.start, range.end);
+    if (!value) {
+      if (existing !== -1) lines.splice(existing, 1);
+      return finalizeTomlLines(lines);
+    }
+    if (existing !== -1) {
+      lines[existing] = replacement;
+    } else {
+      lines.splice(range.end, 0, replacement);
+    }
+    return finalizeTomlLines(lines);
+  }
+
+  const topEnd = topLevelEndIndex(lines);
+  const existing = assignmentLineIndex(lines, fieldName, 0, topEnd);
+  if (!value) {
+    if (existing !== -1) lines.splice(existing, 1);
+    return finalizeTomlLines(lines);
+  }
+  if (existing !== -1) {
+    lines[existing] = replacement;
+  } else {
+    lines.splice(topEnd, 0, replacement);
+  }
+  return finalizeTomlLines(lines);
+}
+
+function setCodexTopLevelInt(configText, fieldName, value) {
+  const lines = String(configText || "").split("\n");
+  if (lines.length === 1 && lines[0] === "") lines.pop();
+  const topEnd = topLevelEndIndex(lines);
+  const existing = assignmentLineIndex(lines, fieldName, 0, topEnd);
+  const replacement = `${fieldName} = ${positiveInt(value, 900000)}`;
+  if (existing !== -1) {
+    lines[existing] = replacement;
+  } else {
+    lines.splice(topEnd, 0, replacement);
+  }
+  return finalizeTomlLines(lines);
+}
+
+function removeCodexTopLevelField(configText, fieldName) {
+  const lines = String(configText || "").split("\n");
+  const existing = assignmentLineIndex(lines, fieldName, 0, topLevelEndIndex(lines));
+  if (existing !== -1) lines.splice(existing, 1);
+  return finalizeTomlLines(lines);
+}
+
+function codexModelProviderName(lines) {
+  const index = assignmentLineIndex(lines, "model_provider", 0, topLevelEndIndex(lines));
+  if (index === -1) return "";
+  const match = lines[index].match(/^\s*model_provider\s*=\s*["']([^"']+)["']/);
+  return match?.[1] || "";
+}
+
+function tomlSectionRange(lines, sectionName) {
+  const header = `[${sectionName}]`;
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\s*\[[^\]]+\]\s*$/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  return { start: start + 1, end };
+}
+
+function topLevelEndIndex(lines) {
+  const index = lines.findIndex((line) => /^\s*\[[^\]]+\]\s*$/.test(line));
+  return index === -1 ? lines.length : index;
+}
+
+function assignmentLineIndex(lines, fieldName, start, end) {
+  const pattern = new RegExp(`^\\s*${fieldName}\\s*=`);
+  for (let index = start; index < end; index += 1) {
+    if (pattern.test(lines[index])) return index;
+  }
+  return -1;
+}
+
+function finalizeTomlLines(lines) {
+  while (lines.length && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.length ? `${lines.join("\n")}\n` : "";
 }
 
 export function providerRowActions(provider) {
