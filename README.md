@@ -2,6 +2,8 @@
 
 管理本机 Codex 配置、会话和远程控制的 macOS 桌面应用。支持通过 Telegram Bot 远程与 Codex 交互。
 
+![CodexManager 截图](docs/images/cm.jpg)
+
 ## 功能
 
 - **Codex 供应商管理**：新增、编辑、删除、切换供应商，激活时自动写入 `~/.codex/config.toml` 和 `~/.codex/auth.json`。
