@@ -290,10 +290,7 @@ function renderProviderEdit() {
           <label>类型<input name="providerType" value="${escapeAttr(isOfficial ? "OpenAI 官方" : "自定义")}" readonly></label>
         </div>
         <label>API Key<input name="apiKey" type="password" placeholder="${draft.hasApiKey ? draft.apiKeyMasked : (isOfficial ? "官方 OAuth 可留空" : "OPENAI_API_KEY")}"></label>
-        <div class="field-row">
-          <label>API 请求地址<input name="baseUrl" value="${escapeAttr(draft.baseUrl || "")}" placeholder="${isOfficial ? "官方 OAuth 不需要填写" : "https://example.com/v1"}" ${isOfficial ? "" : "required"}></label>
-          <button type="button" class="link-button" data-action="read-config">管理与测试</button>
-        </div>
+        <label>API 请求地址<input name="baseUrl" value="${escapeAttr(draft.baseUrl || "")}" placeholder="${isOfficial ? "官方 OAuth 不需要填写" : "https://example.com/v1"}" ${isOfficial ? "" : "required"}></label>
         <p class="hint">${isOfficial ? "OpenAI 官方使用 Codex CLI 自带 OAuth，激活时写入空 auth.json 和空 config.toml。" : "自定义供应商按 OpenAI Responses 兼容格式写入 Codex 配置。"}</p>
         <label>模型名称<input name="model" value="${escapeAttr(draft.model || "")}" placeholder="${isOfficial ? "官方默认模型可留空" : "gpt-5.4"}" ${isOfficial ? "" : "required"}></label>
         <div class="form-grid two compact-options">
@@ -426,7 +423,6 @@ async function handleAction(action, dataset = {}) {
   if (action === "delete-session") return handleDeleteSession(dataset.id || "");
   if (action === "delete-selected-sessions") return handleDeleteSelectedSessions();
   if (action === "use-provider-preset") return applyProviderPreset(dataset.id || "");
-  if (action === "read-config") return loadLiveCodexConfig();
 }
 
 async function showProviders() {
